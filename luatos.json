@@ -1,0 +1,27 @@
+{
+  "luatools": {
+    "version": "3.1.0"
+  },
+  "build": {
+    "time": "2025-09-02 11:15:37"
+  },
+  "lib": {
+    "dirs": [
+      "lib"
+    ]
+  },
+  "core": "LuatOS-SoC_V2012_Air780EPM_103.soc",
+  "projec_name": "780\u9c7c\u5858\u63a7\u5236\u677f",
+  "project_info": {
+    "type": ".soc",
+    "active": "False",
+    "output_suffix_enable": "False",
+    "code_enable": "False",
+    "print_mode": "2",
+    "add_core": "False",
+    "only_code": "False",
+    "only_luac_code": "False",
+    "default_lib": "True"
+  },
+  "version": 1
+}
