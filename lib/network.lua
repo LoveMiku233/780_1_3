@@ -517,7 +517,7 @@ end
 -- 兼容接口
 function _M.init(is_wan)
     log.info("ch390", "打开LDO供电")
-    gpio.setup(20, 1)  --打开lan供电
+    --gpio.setup(20, 1)  --打开lan供电
     if is_wan then
         init_wan_mode()
     else

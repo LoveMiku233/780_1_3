@@ -427,7 +427,7 @@ sys.taskInit(function()
     mqtt1:subscribe(sub_url, 0, cloud_parse)
     
     -- 初始化电源类型为三相电
-    set_power_type(3)
+    set_power_type(2)
 end)
 
 -- RN8302B电流监测任务 - 分四次读取，每次读取三个通道
