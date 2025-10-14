@@ -15,6 +15,7 @@ _M.is_init = false -- 是否初始
 function _M.init()
     for name, pin in pairs(relays) do
         gpio.setup(pin, 1)
+        gpio.set(pin, 1)
         log.debug(module, string.format("relays %s (PIN %d) initialized", name, pin))
     end
     _M.is_init = true

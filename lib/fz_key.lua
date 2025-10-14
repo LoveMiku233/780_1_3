@@ -33,7 +33,7 @@ function _M.init()
         gpio.setup(pin, function()
             sys.publish("KEY", name)
             log.debug(module, name, pin)
-        end, gpio.PULLUP, gpio.RISING)
+        end, gpio.PULLUP, gpio.FALLING)
         gpio.debounce(pin, 300, 1)
         log.debug(module, string.format("KEY %s (PIN %d) initialized", name, pin))
     end

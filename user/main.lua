@@ -6,7 +6,6 @@ _G.sys     = require("sys")
 _G.sysplus = require("sysplus")
 
 log.setLevel("DEBUG")
--- 配置文件
 
 -- 初始化网络
 local config = require("config")
@@ -21,6 +20,7 @@ local fzadcs = require("fz_adc")
 local RX8025T = require("RX8025T")
 local rn8302b = require("rn8302b")
 local supply = require("supply")
+local net_switch = require("net_switch")
 
 -- 485 modbus
 local ctrl_485 = nil
@@ -79,6 +79,19 @@ local power_type_flag = 2  -- 默认三相电，2表示两相电，3表示三相
 local current_data = {
     chip1 = {0, 0, 0, 0, 0, 0},
     chip2 = {0, 0, 0, 0, 0, 0}
+}
+
+local net_config = {
+    ethernet = {
+        spi_id = 0,           -- SPI设备ID
+        cs_pin = 8,          -- 片选引脚
+        type = netdrv.CH390,  -- 网卡芯片类型
+        baudrate = 51200000,  -- SPI波特率
+        ping_ip = "202.89.233.101"
+    },
+    mobile_4g = {
+        ping_ip = "202.89.233.101"
+    }
 }
 
 local multi_sensor_data = {
@@ -152,19 +165,6 @@ if wdt then
     sys.timerLoopStart(wdt.feed, 3000) -- 3s喂一次狗
 end
 
--- 网络状态
-function network_led_task(net_type, adapter)
-    if type(net_type)=="string" then
-        log.info("netdrv_multiple_notify_cbfunc", "use new adapter", net_type, adapter)
-        log.info("当前网络状态", net_type)  
-    elseif type(net_type)=="nil" then
-        log.warn("netdrv_multiple_notify_cbfunc", "no available adapter", net_type, adapter)
-    else
-        log.warn("netdrv_multiple_notify_cbfunc", "unknown status", net_type, adapter)
-    end
-end
-
-
 
 -- 1. 初始化串口
 sys.taskInit(function()
@@ -189,12 +189,305 @@ sys.taskInit(function()
     -- 初始化供电模块
     supply.init()
 
-    network_led_task("4G_1", nil)
-    sys.waitUntil("IP_READY")
 end)
 
 
--- 修改缺相检测函数，根据电源类型进行不同的检测
+----------------------------------------------------------------------测试用-----------------------------------------------------
+
+sys.taskInit(function()
+    while true do
+        local pres, temp, humi = bme.getData()
+        log.info("BME280", "pres:", pres, "temp:", temp)
+        sys.wait(1000)
+    end
+end)
+
+sys.taskInit(function()
+    sys.wait(1000)
+    if not RX8025T.init() then
+        return
+    end
+
+    --RX8025T.set_time(25,10,7,15,26,0)
+
+    local time_data = RX8025T.read_time()
+    if time_data then
+        log.info("当前时间",RX8025T.format_time(time_data))
+    end
+
+    while true do
+        local time_data = RX8025T.read_time()
+        if time_data then
+            log.info("当前时间",RX8025T.format_time(time_data))
+        end
+        sys.wait(1000)
+    end
+end)
+
+sys.taskInit(function()
+    while true do
+        -- 采集电压mv
+        voltage = fzadcs.get_adc(0)
+        log.info("获取adc为:", voltage)
+        -- 12V = 1.18V 0 = 0      
+        voltage = voltage / 1000 * 10.169
+        log.info("测得电压为：", voltage)
+        sys.wait(5000)
+    end
+end)
+------------------------------------------------------------------网咯切换-------------------------------------------------------------------
+local function network_status_callback(event_type, data)
+    if event_type == "ethernet" then
+        if data == 2 then -- CONNECTED
+            log.info("NET_CALLBACK", "以太网连接成功")
+        elseif data == 0 then -- DISCONNECTED
+            log.warn("NET_CALLBACK", "以太网连接断开")
+        end
+    elseif event_type == "4g" then
+        if data == 2 then -- CONNECTED
+            log.info("NET_CALLBACK", "4G网络连接成功")
+        elseif data == 0 then -- DISCONNECTED
+            log.warn("NET_CALLBACK", "4G网络连接断开")
+        end
+    elseif event_type == "switch" then
+        log.info("NET_CALLBACK", "网络切换到:", data)
+        
+        -- 网络切换后重启MQTT连接
+        if data ~= "none" then
+            sys.taskInit(function()
+                sys.wait(3000) -- 等待网络稳定
+                
+                if mqtt1 then
+                    log.info("MQTT_RECONNECT", "网络切换，重启MQTT连接...")
+                    
+                    -- 先关闭现有连接
+                    mqtt1:close()
+                    sys.wait(2000)
+                    
+                    -- 重新初始化并连接
+                    mqtt1:init()
+                    mqtt1:connect()
+                    
+                    -- 等待MQTT连接建立并重新订阅
+                    local mqtt_start = os.time()
+                    local reconnect_success = false
+                    
+                    while os.time() - mqtt_start < 30 do -- 最多等待30秒
+                        if mqtt1:get_is_connected() then
+                            log.info("MQTT_RECONNECT", "MQTT重新连接成功")
+                            
+                            -- 重新订阅主题
+                            local sub_result = mqtt1:subscribe(sub_url, 0, cloud_parse)
+                            --if sub_result then
+                               -- log.info("MQTT_RECONNECT", "重新订阅主题成功:", sub_url)
+                            --else
+                                --log.error("MQTT_RECONNECT", "重新订阅主题失败:", sub_url)
+                            --end
+                            
+                            -- 重新上报设备状态
+                            sys.wait(1000)
+                            update_changed_data(multi_sensor_data)
+                            
+                            reconnect_success = true
+                            break
+                        end
+                        sys.wait(1000)
+                    end
+                    
+                    --if not reconnect_success then
+                       -- log.error("MQTT_RECONNECT", "MQTT重连超时")
+                   -- end
+                end
+            end)
+        end
+    end
+end
+
+sys.taskInit(function()
+    local last_sync_time = 0
+    local sync_interval = 3600 -- 1小时同步一次
+    
+    while true do
+        local current_time = os.time()
+        
+        -- 检查是否需要时间同步（首次运行或间隔时间到）
+        if last_sync_time == 0 or (current_time - last_sync_time) > sync_interval then
+            if net_switch.is_connected() then
+                log.info("TIME_SYNC", "开始时间同步...")
+                socket.sntp()
+                
+                -- 等待时间同步完成
+                local sync_start = os.time()
+                local sync_success = false
+                
+                while os.time() - sync_start < 10 do
+                    local t = os.date("*t")
+                    if t.year > 2020 then -- 时间已经同步
+                        log.info("TIME_SYNC", "时间同步成功:", 
+                            string.format("%04d-%02d-%02d %02d:%02d:%02d", 
+                            t.year, t.month, t.day, t.hour, t.min, t.sec))
+                        
+                        -- 发送时间到显示屏
+                        if display_232 then
+                            local json_time = string.format(
+                                '{"year":%d,"mon":%d,"day":%d,"hour":%d,"min":%d,"sec":%d}',
+                                t.year, t.month, t.day, t.hour, t.min, t.sec
+                            )
+                            display_232:send_str(json_time.."\r\n")
+                        end
+                        
+                        last_sync_time = os.time()
+                        sync_success = true
+                        break
+                    end
+                    sys.wait(1000)
+                end
+                
+                --if not sync_success then
+                    --log.warn("TIME_SYNC", "时间同步失败")
+                --end
+            else
+                --log.warn("TIME_SYNC", "无网络连接，跳过时间同步")
+            end
+        end
+        
+        sys.wait(60000) -- 每分钟检查一次
+    end
+end)
+
+-- 2. 初始化网络切换
+sys.taskInit(function()
+    sys.wait(3000)  -- 等待硬件初始化完成
+    
+    log.info("main", "开始初始化网络切换...")
+    
+    -- 初始化网络切换模块
+    local success = net_switch.init(net_config, network_status_callback)
+    if not success then
+        log.error("main", "网络切换初始化失败")
+        return
+    end
+    
+    log.info("main", "网络切换初始化完成，等待网络就绪...")
+    
+    -- 等待网络就绪
+    sys.waitUntil("IP_READY", 30000)
+    
+    log.info("main", "网络已就绪，开始业务初始化...")
+end)
+
+-- 3. MQTT 和 FOTA 初始化
+sys.taskInit(function()
+    -- 等待网络连接
+    local network_wait_start = os.time()
+    while not net_switch.is_connected() do
+        if os.time() - network_wait_start > 60 then
+            log.warn("MQTT", "等待网络超时，尝试继续初始化")
+            break
+        end
+        log.info("MQTT", "等待网络连接...")
+        sys.wait(2000)
+    end
+    
+    log.info("MQTT", "开始初始化MQTT...")
+    
+    -- 更新配置
+    config.mqtt.device_id = string.format("%s%s", config.mqtt.product_id, mobile.imei())
+    config.update_url = string.format("###%s?imei=%s&productKey=%s&core=%s&version=%s", 
+        config.FIRMWARE_URL, mobile.imei(), config.PRODUCT_KEY, rtos.version(), VERSION)
+    
+    -- 初始化FOTA
+    log.info("FOTA", "开始固件更新检查")
+    fzfota.init(config)
+    fzfota.print_version()
+    fzfota.start_timer_update()
+    
+    -- 初始化MQTT
+    mqtt1 = fzmqtt.new(config.mqtt)
+    
+    local mqtt_init_success = false
+    local init_attempts = 0
+    
+    while not mqtt_init_success and init_attempts < 3 do
+        init_attempts = init_attempts + 1
+        --log.info("MQTT", fmt("第%d次尝试初始化MQTT", init_attempts))
+        
+        if mqtt1:init() then
+            if mqtt1:connect() then
+                -- 等待MQTT连接建立
+                local mqtt_start = os.time()
+                while os.time() - mqtt_start < 20 do
+                    if mqtt1:get_is_connected() then
+                        log.info("MQTT", "MQTT连接成功")
+                        
+                        -- 订阅主题
+                        local sub_ok = mqtt1:subscribe(sub_url, 0, cloud_parse)
+                        if sub_ok then
+                            log.info("MQTT", "订阅主题成功:", sub_url)
+                            mqtt_init_success = true
+                            
+                            -- 发送设备上线消息
+                            local online_msg = json.encode({
+                                deviceStatus = "online",
+                                imei = imei,
+                                timestamp = os.time(),
+                                network = net_switch.get_current_network(),
+                                ip = net_switch.get_current_ip()
+                            })
+                            mqtt1:publish("$thing/up/event/"..imei, online_msg, 0)
+                            
+                            -- 上报完整设备状态
+                            sys.wait(2000)
+                            update_changed_data(multi_sensor_data)
+                            
+                            break
+                        else
+                            log.error("MQTT", "订阅主题失败")
+                        end
+                    end
+                    sys.wait(1000)
+                end
+            end
+        end
+        
+        if not mqtt_init_success then
+            log.warn("MQTT", fmt("MQTT初始化失败，%d秒后重试", 5))
+            sys.wait(5000)
+        end
+    end
+    
+    if not mqtt_init_success then
+        log.error("MQTT", "MQTT初始化完全失败")
+    end
+    
+    -- 初始化电源类型
+    set_power_type(2)
+end)
+
+sys.taskInit(function()
+    sys.wait(5000)
+    while true do
+        local status = net_switch.get_network_status()
+        log.info("NET_MONITOR", 
+            string.format("网络状态 - 当前: %s, 以太网: %d, 4G: %d", 
+            status.current, status.ethernet, status.mobile_4g))
+        
+        if net_switch.is_connected() then
+            local ip = net_switch.get_current_ip()
+            log.info("NET_MONITOR", "当前IP:", ip)
+            multi_sensor_data.network_type = status.current
+            multi_sensor_data.network_ip = ip
+        else
+            log.warn("NET_MONITOR", "无网络连接")
+            multi_sensor_data.network_type = "none"
+            multi_sensor_data.network_ip = "0.0.0.0"
+        end
+        
+        sys.wait(30000) -- 30秒打印一次状态
+    end
+end)
+-------------------------------------------电流检测--------------------------------------------------
+
 function check_phase_unbalance_c_style(group_config, chip1_data, chip2_data, group_index)
     local currents = {}
     local chip_data = (group_config.chip == 1) and chip1_data or chip2_data
@@ -229,22 +522,26 @@ function check_phase_unbalance_c_style(group_config, chip1_data, chip2_data, gro
         log.info("PHASE_CHECK_3PHASE", string.format("三相电-组%d: 电流[%.3fA, %.3fA, %.3fA]", 
             group_index, current1, current2, current3))
     else
-        -- 两相电检测：检测任意一相是否有电流，另一相无电流
-        -- 对于两相电，我们假设使用前两相，第三相应该没有电流
-        local has_current1 = current1 > 0.05
-        local has_current2 = current2 > 0.05
-        local has_current3 = current3 > 0.05
+        -- 两相电检测：检测任意两相之间的电流差值
+        -- 计算所有两两组合的电流差值
+        local diff12 = math.abs(current1 - current2)
+        local diff13 = math.abs(current1 - current3) 
+        local diff23 = math.abs(current2 - current3)
         
-        -- 两相电的缺相判断：任意一相有电流而另一相无电流，或者第三相有电流（异常）
-        is_unbalanced = (has_current1 and not has_current2) or 
-                       (has_current2 and not has_current1) or
-                       has_current3  -- 第三相有电流视为异常
+        -- 两相电的缺相判断：任意两相之间的电流差值超过阈值
+        is_unbalanced = (diff12 > PHASE_UNBALANCE_THRESHOLD_ABS) or
+                       (diff13 > PHASE_UNBALANCE_THRESHOLD_ABS) or
+                       (diff23 > PHASE_UNBALANCE_THRESHOLD_ABS)
         
-        log.info("PHASE_CHECK_2PHASE", string.format("两相电-组%d: 电流[%.3fA, %.3fA, %.3fA] 状态[%s,%s,%s]", 
-            group_index, current1, current2, current3,
-            has_current1 and "有" or "无",
-            has_current2 and "有" or "无", 
-            has_current3 and "有" or "无"))
+        -- 记录哪两相之间出现了不平衡
+        local unbalanced_pairs = {}
+        if diff12 > PHASE_UNBALANCE_THRESHOLD_ABS then table.insert(unbalanced_pairs, "1-2") end
+        if diff13 > PHASE_UNBALANCE_THRESHOLD_ABS then table.insert(unbalanced_pairs, "1-3") end
+        if diff23 > PHASE_UNBALANCE_THRESHOLD_ABS then table.insert(unbalanced_pairs, "2-3") end
+        
+        log.info("PHASE_CHECK_2PHASE", string.format("两相电-组%d: 电流[%.3fA, %.3fA, %.3fA] 差值[%.3f,%.3f,%.3f] 不平衡相位:%s", 
+            group_index, current1, current2, current3, diff12, diff13, diff23,
+            table.concat(unbalanced_pairs, ",")))
     end
     
     -- 记录详细的检测信息
@@ -325,110 +622,6 @@ function set_power_type(power_type)
         return false
     end
 end
-
-sys.taskInit(function()
-    while true do
-        local pres, temp, humi = bme.getData()
-        log.info("BME280", "pres:", pres, "temp:", temp)
-        sys.wait(1000)
-    end
-end)
-
-sys.taskInit(function()
-    sys.wait(1000)
-    if not RX8025T.init() then
-        return
-    end
-
-    if RX8025T.need_time_set() then
-        log.info("RX8025T", "需要设置时间")
-        RX8025T.safe_set_time(25,9,24,8,54,0)
-    else
-        log.info("不需要设置时间，使用保持的时间")
-    end
-
-    local time_data = RX8025T.read_time()
-    if time_data then
-        log.info("当前时间",RX8025T.format_time(time_data))
-    end
-
-    while true do
-        local time_data = RX8025T.read_time()
-        if time_data then
-            log.info("当前时间",RX8025T.format_time(time_data))
-        end
-        sys.wait(1000)
-    end
-end)
-
-sys.taskInit(function()
-    while true do
-        -- 供电模块任务
-        sys.wait(120000)
-        supply.on("led_supply1")
-        supply.on("led_supply2")
-        sys.wait(120000)
-        -- 关闭供电模块
-        supply.off("led_supply1")
-        supply.off("led_supply2")
-        sys.wait(600000)
-    end
-end)
-
-sys.taskInit(function()
-    while true do
-        -- 采集电压mv
-        voltage = fzadcs.get_adc(0)
-        log.info("获取adc为:", voltage)
-        -- 12V = 1.18V 0 = 0      
-        voltage = voltage / 1000 * 10.169
-        log.info("测得电压为：", voltage)
-        sys.wait(5000)
-    end
-end)
-
--- 3. MQTT 初始化任务
-sys.taskInit(function()
-     -- 确保无nil错误
-    log.info("main", "start init mqtt")
-    
-    -- 更新配置
-    config.mqtt.device_id = string.format("%s%s", config.mqtt.product_id, mobile.imei())
-    config.update_url = string.format("###%s?imei=%s&productKey=%s&core=%s&version=%s", config.FIRMWARE_URL, mobile.imei(), config.PRODUCT_KEY, rtos.version(), VERSION)
-    log.info("main", "mqtt config:", json.encode(config.mqtt))
-    -- 等待底层网络就绪
-    sys.waitUntil("IP_READY")
-    -- 开始同步ntp
-    socket.sntp()
-    local ret = sys.waitUntil("NTP_UPDATE", 5000)
-    if ret then
-        log.info("NTP", "时间同步成功")
-        -- 获取当前时间
-        local t = os.date("*t") -- 返回一个table，包含year, month, day, hour, min, sec等字段
-        -- 构造JSON字符串
-        local json = string.format(
-            '{"year":%d,"mon":%d,"day":%d,"hour":%d,"min":%d,"sec":%d}',
-            t.year, t.month, t.day, t.hour, t.min, t.sec
-        )
-        display_232:send_str(json.."\r\n")
-        log.info("NTP", "当前时间:", json)
-    else
-        log.info("NTP", "时间同步失败")
-    end
-    -- 开始更新固件
-    log.info("fota", "start fota")
-    fzfota.init(config)
-    fzfota.print_version()
-    fzfota.start_timer_update()
-    mqtt1:init()
-    mqtt1:connect()
-    sys.waitUntil(mqtt1:get_instance_id().."CONNECTED")
-    log.info("main", "MQTT connected, now subscribing & publishing")
-    mqtt1:subscribe(sub_url, 0, cloud_parse)
-    
-    -- 初始化电源类型为三相电
-    set_power_type(2)
-end)
 
 -- RN8302B电流监测任务 - 分四次读取，每次读取三个通道
 sys.taskInit(function()
@@ -539,9 +732,11 @@ sys.taskInit(function()
     end
 end)
 
+----------------------------------------------------------------------------------------------------------------------------------------
+
 function update_changed_data(new_data)
     if type(new_data) ~= "table" then
-        log.error("update", "Invalid data passed to update_changed_data:", type(new_data))
+        log.error("UPDATE", "无效数据:", type(new_data))
         return
     end
 
@@ -551,22 +746,60 @@ function update_changed_data(new_data)
     for key, new_value in pairs(new_data) do
         local old_value = multi_sensor_data_old[key]
         
-        if old_value == nil or math.abs(new_value - old_value) > 0.1 then
+        -- 安全地比较值，处理不同类型的数据
+        local should_update = false
+        
+        if old_value == nil then
+            -- 新字段，总是更新
+            should_update = true
+        else
+            local new_type = type(new_value)
+            local old_type = type(old_value)
+            
+            if new_type == "number" and old_type == "number" then
+                -- 都是数字，比较差值
+                if math.abs(new_value - old_value) > 0.1 then
+                    should_update = true
+                end
+            elseif new_type == "string" and old_type == "string" then
+                -- 都是字符串，直接比较
+                if new_value ~= old_value then
+                    should_update = true
+                end
+            elseif new_type ~= old_type then
+                -- 类型不同，总是更新
+                should_update = true
+            else
+                -- 其他类型，使用安全比较
+                if tostring(new_value) ~= tostring(old_value) then
+                    should_update = true
+                end
+            end
+        end
+        
+        if should_update then
             changed_data[key] = new_value
             multi_sensor_data_old[key] = new_value
             has_changes = true
+            log.debug("UPDATE", string.format("字段 %s 变化: %s -> %s", 
+                key, tostring(old_value), tostring(new_value)))
         end
     end
     
     if has_changes then
         local changed_data_str = json.encode(changed_data, "2f")
         local display_data_str = json.encode(multi_sensor_data, "2f")
-        log.info("update", "上传变化的数据:", changed_data_str)
-        log.info("update", "上传到屏幕的数据:", display_data_str)
-        display_232:send_str(display_data_str.."\r\n")
-        mqtt1:publish(pub_url, changed_data_str, 0)
+        log.info("UPDATE", "上传变化数据:", changed_data_str)
+        
+        if display_232 then
+            display_232:send_str(display_data_str.."\r\n")
+        end
+        
+        if mqtt1 and mqtt1:get_is_connected() then
+            mqtt1:publish(pub_url, changed_data_str, 0)
+        end
     else
-        log.info("update", "数据无变化，不上传")
+        log.debug("UPDATE", "数据无变化")
     end
 end
 
@@ -732,7 +965,7 @@ sys.taskInit(function()
     while true do
         local _, key_name = sys.waitUntil("KEY")
         fzrelays.toggle(key_name)
-        sys.wait(200)
+        sys.wait(500)
     end
 end)
 
@@ -744,6 +977,10 @@ sys.taskInit(function()
     sys.timerLoopStart(get_self_data, 1000)
     
     while true do
+        sys.wait(120000)
+        supply.on("led_supply1")
+        supply.on("led_supply2")
+        sys.wait(120000)
         sensor_485:send_command(do_sat1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
         sys.wait(1000)
         sensor_485:send_command(do_sat2_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
@@ -752,7 +989,10 @@ sys.taskInit(function()
         sys.wait(1000)
         sensor_485:send_command(ph1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
         sys.wait(2000)
-        sys.wait(5000)
+                -- 关闭供电模块
+        supply.off("led_supply1")
+        supply.off("led_supply2")
+        sys.wait(600000)
     end
 end)
 

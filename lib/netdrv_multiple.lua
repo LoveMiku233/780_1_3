@@ -67,6 +67,8 @@ local function netdrv_multiple_task_func()
     )
 end
 
+-- 设置网卡状态变化通知回调函数netdrv_multiple_notify_cbfunc
+libnetif.notify_status(netdrv_multiple_notify_cbfunc)
 
 -- 如果存在udp网络应用，并且udp网络应用中，根据应用层的心跳能够判断出来udp数据通信出现了异常；
 -- 可以在判断出现异常的位置，调用一次libnetif.check_network_status()接口，强制对当前正式使用的网卡进行一次连通性检测；
