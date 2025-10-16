@@ -182,12 +182,12 @@ sys.taskInit(function()
     fzkeys.init()
     -- 初始化bme280
     bme.init()
-    -- 初始化adc
-    fzadcs.init(0, 4.0)
-    -- 初始化rn8302b 
-    rn8302b.init()
-    -- 初始化供电模块
-    supply.init()
+    -- -- 初始化adc
+    -- fzadcs.init(0, 4.0)
+    -- -- 初始化rn8302b 
+    -- rn8302b.init()
+    -- -- 初始化供电模块
+    -- supply.init()
 
 end)
 
@@ -826,7 +826,6 @@ function sensor_parse(data)
 end
 
 -- 控制命令缓存
-
 function push_ctrl_cmd(cmd)
     if #ctrl_cmd_buffer > 4 then  -- 限制命令队列长度
         table.remove(ctrl_cmd_buffer, 1)  -- 淘汰最旧命令
