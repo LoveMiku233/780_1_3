@@ -40,6 +40,7 @@ local sub_url = "$thing/down/property/"..imei
 local do_sat1_addr = 0x0c
 local do_sat2_addr = 0x05
 local do_sat3_addr = 0x06
+local do_sat4_addr = 0x07
 local ph1_addr = 0x03
 -- 控制板地址
 local ctrl_addr = 0x02
@@ -72,7 +73,7 @@ local phase_unbalance_status = {
     group4 = false
 }
 
-local power_type_flag = 2  -- 默认两相电
+local power_type_flag = 3  -- 默认两相电
 
 local current_data = {
     chip1 = {0, 0, 0, 0, 0, 0},
@@ -92,35 +93,62 @@ local net_config = {
     }
 }
 
+local is_reconnecting = false
+
+local command_cache = {}
+local CACHE_TIMEOUT = 5 
+
+local CONTROL_MODE = {
+    ONE_SENSOR_CONTROL_FOUR_RELAYS = 1,  -- 一个传感器控制四个继电器
+    ONE_SENSOR_CONTROL_ONE_RELAY = 2,    -- 一个传感器控制一个继电器
+    TWO_SENSORS_CONTROL_FOUR_RELAYS = 3, -- 两个传感器控制四个继电器（传感器1控制K1K2，传感器2控制K3K4）
+    THREE_SENSORS_CONTROL_FOUR_RELAYS = 4 -- 三个传感器控制四个继电器（传感器1控制K1，传感器2控制K2，传感器3控制K3K4）
+}
+
+-- 继电器操作延时配置
+local RELAY_OPERATION_DELAY = {
+    ON_DELAY = 1000,   -- 打开继电器延时2秒
+    OFF_DELAY = 1000   -- 关闭继电器延时1秒
+}
+
+-- 当前控制模式，默认为一个传感器控制四个继电器
+local current_control_mode = CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS
+
+-- 删除溶解氧自动控制相关配置
+
 local multi_sensor_data = {
     water_temp1 = 0.0,
     water_temp2 = 0.0,
     water_temp3 = 0.0,
+    water_temp4 = 0.0,
     do_sat1 = 0.0,
     do_sat2 = 0.0,
     do_sat3 = 0.0,
+    do_sat4 = 0.0,
     ph1 = 0.0,
-    sw11 = 1,
-    sw12 = 1,
-    sw13 = 1,
-    sw14 = 1,
+    sw11 = 0,
+    sw12 = 0,
+    sw13 = 0,
+    sw14 = 0,
     fault11 = 0,
     fault12 = 0,
     fault13 = 0,
     fault14 = 0,
-    current11 = -1,
-    current12 = -1,
-    current13 = -1,
-    current14 = -1,
+    current11 = 0,
+    current12 = 0,
+    current13 = 0,
+    current14 = 0,
 }
 
 local multi_sensor_data_old = {
     water_temp1 = 0.0,
     water_temp2 = 0.0,
     water_temp3 = 0.0,
+    water_temp4 = 0.0,
     do_sat1 = 0.0,
     do_sat2 = 0.0,
     do_sat3 = 0.0,
+    do_sat4 = 0.0,
     ph1 = 0.0,
     sw11 = 0,
     sw12 = 0,
@@ -193,6 +221,7 @@ local modbus_holding_registers = {
     [0x0014] = 0,  -- 水温3
     [0x0015] = 0,  -- 溶解氧3
     [0x0016] = 0, [0x0017] = 0,  -- pH1 (32位浮点数)
+    [0x0018] = CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS  -- 控制模式
 }
 
 -- 看门狗
@@ -201,15 +230,238 @@ if wdt then
     sys.timerLoopStart(wdt.feed, 3000)
 end
 
+-- ========== 控制模式设置函数 ==========
+-- 设置控制模式
+function set_control_mode(mode)
+    if mode == CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS or 
+       mode == CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY or
+       mode == CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS or
+       mode == CONTROL_MODE.THREE_SENSORS_CONTROL_FOUR_RELAYS then
+        
+        current_control_mode = mode
+        multi_sensor_data.control_mode = mode
+        modbus_holding_registers[0x0018] = mode
+        
+        local mode_description = ""
+        if mode == CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS then
+            mode_description = "一个传感器控制四个继电器"
+        elseif mode == CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY then
+            mode_description = "一个传感器控制一个继电器"
+        elseif mode == CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS then
+            mode_description = "两个传感器控制四个继电器（传感器1控制K1K2，传感器2控制K3K4）"
+        elseif mode == CONTROL_MODE.THREE_SENSORS_CONTROL_FOUR_RELAYS then
+            mode_description = "三个传感器控制四个继电器（传感器1控制K1，传感器2控制K2，传感器3控制K3K4）"
+        end
+        
+        log.info("CONTROL_MODE", string.format("控制模式已设置为: %s", mode_description))
+        
+        -- 上报模式变化
+        update_changed_data({control_mode = mode})
+        
+        return true
+    else
+        log.error("CONTROL_MODE", "无效的控制模式:", mode)
+        return false
+    end
+end
+
+-- 解析控制模式设置指令
+function parse_control_mode_command(data)
+    local bytes = {data:byte(1, #data)}
+    
+    -- 检查指令格式: FA 02 XX FE
+    if bytes[1] == 0xFA and bytes[2] == 0x02 and bytes[4] == 0xFE then
+        local mode = bytes[3]
+        
+        if mode == 0x01 then
+            -- 设置为一个传感器控制四个继电器模式
+            set_control_mode(CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS)
+            return true
+        elseif mode == 0x02 then
+            -- 设置为一个传感器控制一个继电器模式
+            set_control_mode(CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY)
+            return true
+        elseif mode == 0x03 then
+            -- 设置为两个传感器控制四个继电器模式
+            set_control_mode(CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS)
+            return true
+        elseif mode == 0x04 then
+            -- 设置为三个传感器控制四个继电器模式
+            set_control_mode(CONTROL_MODE.THREE_SENSORS_CONTROL_FOUR_RELAYS)
+            return true
+        else
+            log.warn("CONTROL_MODE", "未知的控制模式指令:", string.format("%02X", mode))
+        end
+    end
+    
+    return false
+end
+
+-- 修改232屏幕数据解析函数，移除自动控制相关解析
+function display_232_parse(data)
+    -- 记录原始数据
+    log.info("DISPLAY_232_RAW", "收到原始数据(hex):", data:toHex())
+    log.info("DISPLAY_232_RAW", "收到原始数据长度:", #data)
+    
+    -- 检查是否是控制模式设置指令
+    if #data == 4 then
+        local success = parse_control_mode_command(data)
+        if success then
+            log.info("CONTROL_MODE", "成功解析控制模式设置指令")
+            return
+        end
+    end
+    
+    -- 原有的JSON解析逻辑
+    local clean_data = data:gsub("[\0\r\n]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if #clean_data > 0 then
+        local json_data, err = json.decode(clean_data)
+        if json_data then
+            log.info("DISPLAY_232", "JSON解析成功")
+            
+            -- 处理屏幕确认消息
+            if json_data.type == "key_ack" then
+                log.info("KEY_ACK", string.format("屏幕确认收到按键%s状态", json_data.key or "unknown"))
+                return
+            elseif json_data.type == "sync_ack" then
+                log.info("SYNC_ACK", "屏幕确认收到状态同步")
+                return
+            elseif json_data.type == "control_mode" then
+                -- 处理控制模式设置
+                handle_control_mode_setting(json_data)
+                return
+            end
+            
+            -- 处理控制命令
+            process_control_command(json_data, "screen")
+            return
+        else
+            log.warn("DISPLAY_232", "JSON解析失败:", err)
+        end
+    end
+    
+    -- 原有的Modbus RTU解析逻辑
+    local modbus_data = parse_modbus_rtu(data)
+    if modbus_data then
+        log.info("DISPLAY_232", "Modbus RTU解析成功")
+        process_modbus_command(modbus_data, "screen")
+    else
+        log.warn("DISPLAY_232", "Modbus RTU解析失败")
+    end
+end
+
+-- 处理控制模式设置
+function handle_control_mode_setting(control_data)
+    log.info("CONTROL_MODE", "收到控制模式设置:", json.encode(control_data))
+    
+    if control_data.mode then
+        local mode = tonumber(control_data.mode)
+        if mode == CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS or mode == CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY then
+            set_control_mode(mode)
+        else
+            log.error("CONTROL_MODE", "无效的控制模式值:", mode)
+        end
+    end
+end
+
+-- 修改云平台数据解析函数，移除自动控制相关处理
+function cloud_parse(data)
+    log.info("CLOUD", "收到云平台数据:", data)
+    
+    local json_data = json.decode(data)
+    if json_data == nil then
+        log.warn("CLOUD", "JSON解析失败")
+        return
+    end
+    
+    -- 处理控制模式设置
+    if json_data.control_mode then
+        handle_control_mode_setting(json_data.control_mode)
+        return
+    end
+    
+    -- 原有的控制命令处理
+    process_control_command(json_data, "cloud")
+end
+
+-- 修正发送完整状态到屏幕函数
+function send_full_status_to_screen()
+    if not display_232 then
+        log.warn("SCREEN", "232显示屏未初始化")
+        return false
+    end
+    
+    -- 获取所有状态数据
+    local sw11 = multi_sensor_data.sw11 or 0
+    local sw12 = multi_sensor_data.sw12 or 0
+    local sw13 = multi_sensor_data.sw13 or 0
+    local sw14 = multi_sensor_data.sw14 or 0
+    
+    local fault11 = multi_sensor_data.fault11 or 0
+    local fault12 = multi_sensor_data.fault12 or 0
+    local fault13 = multi_sensor_data.fault13 or 0
+    local fault14 = multi_sensor_data.fault14 or 0
+    
+    -- 获取并处理电流值
+    local current11 = multi_sensor_data.current11 or 0
+    local current12 = multi_sensor_data.current12 or 0
+    local current13 = multi_sensor_data.current13 or 0
+    local current14 = multi_sensor_data.current14 or 0
+    
+    -- 四舍五入到两位小数
+    current11 = math.floor(current11 * 100 + 0.5) / 100
+    current12 = math.floor(current12 * 100 + 0.5) / 100
+    current13 = math.floor(current13 * 100 + 0.5) / 100
+    current14 = math.floor(current14 * 100 + 0.5) / 100
+    
+    log.info("CURRENT_SEND", string.format("发送电流值: %.2f, %.2f, %.2f, %.2f A", 
+             current11, current12, current13, current14))
+    
+    -- 将浮点数转换为4字节大端序
+    local function float_to_bytes_big_endian(value)
+        local bytes = pack.pack(">f", value)  -- 大端序
+        return bytes:byte(1), bytes:byte(2), bytes:byte(3), bytes:byte(4)
+    end
+    
+    -- 获取字节
+    local c11_b1, c11_b2, c11_b3, c11_b4 = float_to_bytes_big_endian(current11)
+    local c12_b1, c12_b2, c12_b3, c12_b4 = float_to_bytes_big_endian(current12)
+    local c13_b1, c13_b2, c13_b3, c13_b4 = float_to_bytes_big_endian(current13)
+    local c14_b1, c14_b2, c14_b3, c14_b4 = float_to_bytes_big_endian(current14)
+    
+    -- 构建Modbus帧
+    local slave_addr = 0x01
+    local function_code = 0x03
+    local byte_count = 0x20
+    
+    local data_part = string.char(
+        -- 继电器状态
+        0x00, sw11, 0x00, sw12, 0x00, sw13, 0x00, sw14,
+        -- 缺相状态
+        0x00, fault11, 0x00, fault12, 0x00, fault13, 0x00, fault14,
+        -- 电流值（大端序）
+        c11_b1, c11_b2, c11_b3, c11_b4,
+        c12_b1, c12_b2, c12_b3, c12_b4,
+        c13_b1, c13_b2, c13_b3, c13_b4,
+        c14_b1, c14_b2, c14_b3, c14_b4
+    )
+    
+    local frame_without_crc = string.char(slave_addr, function_code, byte_count) .. data_part
+    local crc = calculate_modbus_crc(frame_without_crc)
+    local modbus_frame = frame_without_crc .. string.char(bit.band(crc, 0xFF), bit.rshift(crc, 8))
+    
+     display_232:send_str(modbus_frame)
+end
+
 -- 1. 初始化串口和硬件
 sys.taskInit(function()
     log.info("main", "start init uart")
     -- 初始化485
-    gpio.setup(16, 0)
+    --gpio.setup(16, 1)
     gpio.setup(27, 1)
     gpio.setup(22, 1)
-    sensor_485 = fzmodbus.new({uartid=1, gpio_485=16, is_485=1, baudrate=9600})
-    ctrl_485 = fzmodbus.new({is_485=1, uartid=2, gpio_485=28, baudrate=9600})
+    sensor_485 = fzmodbus.new({uartid=2, gpio_485=23, is_485=1, baudrate=9600})
+    --ctrl_485 = fzmodbus.new({is_485=1, uartid=2, gpio_485=28, baudrate=9600})
     display_232 = fzmodbus.new({uartid=3, baudrate=115200})
     
     -- 初始化其他硬件
@@ -221,23 +473,24 @@ sys.taskInit(function()
     supply.init()
     
     log.info("UART", "232显示屏接口初始化完成")
+    send_full_status_to_screen()
 end)
 
 -- 2. 网络切换初始化
 sys.taskInit(function()
     sys.wait(3000)
-    
+        
     log.info("main", "开始初始化网络切换...")
-    
+        
     local success = net_switch.init(net_config, network_status_callback)
     if not success then
         log.error("main", "网络切换初始化失败")
         return
     end
-    
+        
     log.info("main", "网络切换初始化完成，等待网络就绪...")
-    sys.waitUntil("IP_READY", 30000)
-    log.info("main", "网络已就绪，开始业务初始化...")
+        sys.waitUntil("IP_READY", 30000)
+        log.info("main", "网络已就绪，开始业务初始化...")
 end)
 
 -- 3. MQTT和FOTA初始化
@@ -258,13 +511,8 @@ sys.taskInit(function()
     -- 更新配置
     config.mqtt.device_id = string.format("%s%s", config.mqtt.product_id, mobile.imei())
     config.update_url = string.format("###%s?imei=%s&productKey=%s&core=%s&version=%s", 
-        config.FIRMWARE_URL, mobile.imei(), config.PRODUCT_KEY, rtos.version(), VERSION)
+    config.FIRMWARE_URL, mobile.imei(), config.PRODUCT_KEY, rtos.version(), VERSION)
     
-    -- 初始化FOTA
-    log.info("FOTA", "开始固件更新检查")
-    fzfota.init(config)
-    fzfota.print_version()
-    fzfota.start_timer_update()
     
     -- 初始化MQTT
     mqtt1 = fzmqtt.new(config.mqtt)
@@ -340,7 +588,10 @@ function network_status_callback(event_type, data)
                     
                     mqtt1:init()
                     mqtt1:connect()
-                    
+                    log.info("FOTA", "开始固件更新检查")
+                    fzfota.init(config)
+                    fzfota.print_version()
+                    fzfota.start_timer_update()
                     local mqtt_start = os.time()
                     local reconnect_success = false
                     
@@ -419,45 +670,11 @@ function parse_modbus_rtu(data)
     end
 end
 
--- 232屏幕数据解析函数 - 专门处理Modbus RTU协议
-function display_232_parse(data)
-    -- 记录原始数据
-    log.info("DISPLAY_232_RAW", "收到原始数据(hex):", data:toHex())
-    log.info("DISPLAY_232_RAW", "收到原始数据长度:", #data)
-    
-    -- 检查数据长度
-    if #data == 0 then
-        log.warn("DISPLAY_232", "收到空数据")
-        return
-    end
-    
-    -- 尝试解析Modbus RTU协议
-    local modbus_data = parse_modbus_rtu(data)
-    if modbus_data then
-        log.info("DISPLAY_232", "Modbus RTU解析成功")
-        process_modbus_command(modbus_data, "screen")
-    else
-        log.warn("DISPLAY_232", "Modbus RTU解析失败，尝试其他格式")
-        
-        -- 如果不是Modbus RTU，尝试JSON格式
-        local clean_data = data:gsub("[\0\r\n]", ""):gsub("^%s+", ""):gsub("%s+$", "")
-        if #clean_data > 0 then
-            local json_data, err = json.decode(clean_data)
-            if json_data then
-                log.info("DISPLAY_232", "JSON解析成功")
-                process_control_command(json_data, "screen")
-            else
-                log.warn("DISPLAY_232", "JSON解析失败:", err)
-            end
-        end
-    end
-end
-
 -- 处理Modbus命令
 function process_modbus_command(modbus_data, source)
     log.info("MODBUS_CMD", string.format("处理来自%s的Modbus命令", source))
     
-    -- 只处理从机地址为1的命令（假设屏幕发送给地址1）
+    -- 只处理从机地址为1的命令
     if modbus_data.slave_addr ~= 0x01 then
         log.warn("MODBUS_CMD", "非本机从机地址:", modbus_data.slave_addr)
         return
@@ -476,21 +693,7 @@ function process_modbus_command(modbus_data, source)
             
             -- 更新状态数据
             local key = "sw1" .. string.sub(relay_name, 2)
-            multi_sensor_data[key] = state
-            
-            -- 发送确认消息
-            local ack_msg = json.encode({
-                [key] = state, 
-                result = "success",
-                source = source,
-                timestamp = os.time()
-            })
-            
-            if source == "screen" and display_232 then
-                display_232:send_str(ack_msg.."\r\n")
-                log.info("MODBUS_CMD", "发送确认消息到屏幕:", ack_msg)
-            end
-            
+            multi_sensor_data[key] = state   
             -- 上报状态变化
             update_changed_data({[key] = state})
         else
@@ -499,24 +702,31 @@ function process_modbus_command(modbus_data, source)
     end
 end
 
--- 云平台数据解析函数
-function cloud_parse(data)
-    log.info("CLOUD", "收到云平台数据:", data)
-    
-    local json_data = json.decode(data)
-    if json_data == nil then
-        log.warn("CLOUD", "JSON解析失败")
-        return
-    end
-    
-    -- 调用统一控制处理函数
-    process_control_command(json_data, "cloud")
-end
-
--- 统一控制命令处理函数（用于云平台JSON格式）
+-- 修改手动控制命令处理，增加延时
 function process_control_command(json_data, source)
     log.info("CONTROL", string.format("来自%s的控制命令:", source), json.encode(json_data))
     
+    -- 生成命令指纹用于去重
+    local command_fingerprint = json.encode(json_data) .. "_" .. source
+    local current_time = os.time()
+    
+    -- 检查是否为重复命令
+    if command_cache[command_fingerprint] and 
+       current_time - command_cache[command_fingerprint] < CACHE_TIMEOUT then
+        log.info("COMMAND_DEDUP", "检测到重复命令，跳过执行:", command_fingerprint)
+        return
+    end
+    
+    -- 缓存命令时间戳
+    command_cache[command_fingerprint] = current_time
+    -- 清理过期缓存
+    for fp, time in pairs(command_cache) do
+        if current_time - time > CACHE_TIMEOUT then
+            command_cache[fp] = nil
+        end
+    end
+    
+    -- 原有命令处理逻辑
     for key, val in pairs(json_data) do
         -- 处理本机继电器控制
         if string.match(key, "^sw1[1-4]$") then
@@ -524,130 +734,45 @@ function process_control_command(json_data, source)
             if relay_name then
                 log.info("CONTROL", string.format("%s控制继电器 %s -> %s", source, relay_name, val == 1 and "ON" or "OFF"))
                 
-                -- 直接控制继电器
-                fzrelays.set_mode(relay_name, val == 1 and "on" or "off")
+                -- 检查状态是否已经一致，避免不必要的操作
+                local current_state = fzrelays.get_mode(relay_name)
+                local target_state = val == 1 and "on" or "off"
                 
-                -- 更新状态数据
-                multi_sensor_data[key] = val
-                
-                -- 发送确认消息
-                local ack_msg = json.encode({
-                    [key] = val, 
-                    result = "success",
-                    source = source,
-                    timestamp = os.time()
-                })
-                
-                -- 根据来源发送确认
-                if source == "screen" and display_232 then
-                    display_232:send_str(ack_msg.."\r\n")
-                    log.info("CONTROL", "发送确认消息到屏幕:", ack_msg)
-                elseif source == "cloud" and mqtt1 and mqtt1:get_is_connected() then
-                    mqtt1:publish("$thing/up/event/"..imei, ack_msg, 0)
-                    log.info("CONTROL", "发送确认消息到云平台:", ack_msg)
+                if (current_state == "on" and val == 1) or (current_state == "off" and val == 0) then
+                    log.info("CONTROL", string.format("继电器 %s 状态已为目标状态，跳过", relay_name))
+                else
+                    -- 根据操作类型添加延时
+                    if val == 1 then
+                        -- 打开操作，添加较长延时
+                        sys.wait(RELAY_OPERATION_DELAY.ON_DELAY)
+                    else
+                        -- 关闭操作，添加较短延时
+                        sys.wait(RELAY_OPERATION_DELAY.OFF_DELAY)
+                    end
+                    
+                    -- 控制继电器
+                    fzrelays.set_mode(relay_name, target_state)
+                    
+                    -- 更新状态数据
+                    multi_sensor_data[key] = val
                 end
-                
+         
                 -- 上报状态变化
                 update_changed_data({[key] = val})
                 
             else
                 log.warn("CONTROL", "未知的继电器:", key)
-            end
-            
-        -- 处理远程控制板继电器
-        elseif string.match(key, "^sw[2-4][1-4]$") then
-            local ctrl_info = remote_ctrl_map[key]
-            if ctrl_info and ctrl_485 then
-                log.info("CONTROL", string.format("%s控制远程继电器 %s -> %s", source, key, val == 1 and "ON" or "OFF"))
-                
-                -- 通过485发送Modbus命令控制远程继电器
-                ctrl_485:send_command(
-                    ctrl_info.addr,
-                    0x06,  -- 写单个寄存器
-                    string.char(0x00, ctrl_info.reg, 0x00, val)
-                )
-                
-                -- 发送确认消息
-                local ack_msg = json.encode({
-                    [key] = val, 
-                    result = "success", 
-                    source = source,
-                    timestamp = os.time()
-                })
-                
-                if source == "screen" and display_232 then
-                    display_232:send_str(ack_msg.."\r\n")
-                elseif source == "cloud" and mqtt1 and mqtt1:get_is_connected() then
-                    mqtt1:publish("$thing/up/event/"..imei, ack_msg, 0)
-                end
-                
-            else
-                log.warn("CONTROL", "未知的远程继电器:", key)
-            end
-            
-        -- 数据查询请求
-        elseif key == "query" then
-            log.info("CONTROL", string.format("%s请求数据查询", source))
-            if val == "full" or val == 1 then
-                -- 完整数据查询
-                update_changed_data(multi_sensor_data)
-            else
-                -- 状态查询
-                get_self_data()
-            end
-            
-        -- 设备重启命令
-        elseif key == "reboot" then
-            log.warn("CONTROL", string.format("%s请求设备重启", source))
-            local ack_msg = json.encode({
-                reboot = "scheduled",
-                result = "success",
-                source = source,
-                timestamp = os.time()
-            })
-            
-            if source == "screen" and display_232 then
-                display_232:send_str(ack_msg.."\r\n")
-            elseif source == "cloud" and mqtt1 and mqtt1:get_is_connected() then
-                mqtt1:publish("$thing/up/event/"..imei, ack_msg, 0)
-            end
-            
-            -- 延迟重启
-            sys.wait(2000)
-            rtos.reboot()
-            
-        -- 心跳包响应
-        elseif key == "heartbeat" then
-            log.debug("CONTROL", string.format("收到%s心跳包", source))
-            if source == "screen" and display_232 then
-                display_232:send_str('{"heartbeat":"ack"}\r\n')
-            elseif source == "cloud" and mqtt1 and mqtt1:get_is_connected() then
-                mqtt1:publish("$thing/up/event/"..imei, '{"heartbeat":"ack"}', 0)
-            end
-            
-        -- 固件更新检查
-        elseif key == "check_update" then
-            log.info("CONTROL", string.format("%s请求固件更新检查", source))
-            if fzfota then
-                fzfota.start_update()
-                local ack_msg = json.encode({
-                    check_update = "started",
-                    result = "success",
-                    source = source,
-                    timestamp = os.time()
-                })
-                
-                if source == "screen" and display_232 then
-                    display_232:send_str(ack_msg.."\r\n")
-                elseif source == "cloud" and mqtt1 and mqtt1:get_is_connected() then
-                    mqtt1:publish("$thing/up/event/"..imei, ack_msg, 0)
-                end
-            end
+            end    
+        end
+        -- 如果是云平台控制且本机继电器状态有变化，同步到屏幕
+        if source == "cloud" then
+            log.info("SCREEN_SYNC", "云平台控制导致继电器状态变化，同步到屏幕")
+            send_full_status_to_screen()
         end
     end
 end
 
--- 更新变化数据
+-- 更新变化数据（只发送到MQTT，不发送到屏幕）
 function update_changed_data(new_data)
     if type(new_data) ~= "table" then
         log.error("UPDATE", "无效数据:", type(new_data))
@@ -696,20 +821,14 @@ function update_changed_data(new_data)
     
     if has_changes then
         local changed_data_str = json.encode(changed_data, "2f")
-        local display_data_str = json.encode(multi_sensor_data, "2f")
-        log.info("UPDATE", "上传变化数据:", changed_data_str)
+        log.info("UPDATE", "上传变化数据到MQTT:", changed_data_str)
         
-        -- 发送到232屏幕
-        if display_232 then
-            display_232:send_str(display_data_str.."\r\n")
-            log.info("DISPLAY_232", "发送数据到屏幕")
-        end
+        -- 只发送到MQTT云平台，不发送到屏幕
+
+        mqtt1:publish(pub_url, changed_data_str, 0)
+        send_full_status_to_screen()
         
-        -- 发送到MQTT云平台
-        if mqtt1 and mqtt1:get_is_connected() then
-            mqtt1:publish(pub_url, changed_data_str, 0)
-            log.info("CLOUD", "发送数据到云平台")
-        end
+        -- 注意：不再向屏幕发送完整数据，只通过按键状态和485原始数据同步
     else
         log.debug("UPDATE", "数据无变化")
     end
@@ -717,6 +836,7 @@ end
 
 -- 传感器数据解析
 function sensor_parse(data) 
+    display_232:send_str(data)
     local payload = fztools.hex_to_bytes(data:toHex())
     if fztools.check_crc(payload) then
         if (payload[1] == do_sat1_addr) then
@@ -728,6 +848,9 @@ function sensor_parse(data)
         elseif (payload[1] == do_sat3_addr) then
             multi_sensor_data.water_temp3 = (bit.lshift(payload[4], 8) + payload[5]) * 0.1
             multi_sensor_data.do_sat3 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+        elseif (payload[1] == do_sat4_addr) then
+            multi_sensor_data.do_sat4 = (bit.lshift(payload[4], 4) + payload[5]) * 0.01
+            multi_sensor_data.water_temp4 = (bit.lshift(payload[6], 4) + payload[7]) * 0.01
         elseif (payload[1] == ph1_addr) then
             _, multi_sensor_data.ph1 = pack.unpack(string.char(payload[4],payload[5],payload[6],payload[7]),">f")
         end
@@ -865,30 +988,67 @@ sys.taskInit(function()
     end
 end)
 
--- 按键处理
+function calculate_modbus_crc(data_str)
+    local crc = 0xFFFF
+    for i = 1, #data_str do
+        crc = bit.bxor(crc, data_str:byte(i))
+        for _ = 1, 8 do
+            local flag = bit.band(crc, 1)
+            crc = bit.rshift(crc, 1)
+            if flag == 1 then
+                crc = bit.bxor(crc, 0xA001)
+            end
+        end
+    end
+    return crc
+end
+
+-- 按键处理任务
 sys.taskInit(function()
     while true do
         local _, key_name = sys.waitUntil("KEY")
+        
+        log.info("KEY_PRESS", "检测到按键:", key_name)
+        
+        -- 切换继电器状态
         fzrelays.toggle(key_name)
-        sys.wait(500)
+        
+        -- 等待状态稳定
+        sys.wait(100)
+        
+        -- 获取继电器状态
+        local state_value = fzrelays.get_mode(key_name)
+        
+        log.info("KEY_STATUS", string.format("继电器 %s 状态: %d", key_name, state_value))
+        
+        -- 更新本地数据
+        local data_key = "sw1" .. string.sub(key_name, 2)
+        multi_sensor_data[data_key] = state_value
+        
+        -- 发送完整状态数据到屏幕
+        send_full_status_to_screen()
+        
+        -- 上报状态变化到MQTT
+        update_changed_data({[data_key] = state_value})
+        
+        sys.wait(500)  -- 防抖延迟
     end
 end)
 
 -- 数据采集任务
 sys.taskInit(function()
     -- 设置回调函数
-    sensor_485:set_receive_callback(false, sensor_parse)
-    display_232:set_receive_callback(false, display_232_parse)
-    ctrl_485:set_receive_callback(false, ctrl_parse)
+    sensor_485:set_receive_callback(false,sensor_parse)
     
-    -- 定时获取本机数据
+    display_232:set_receive_callback(false, display_232_parse)
+    
     sys.timerLoopStart(get_self_data, 1000)
     
     while true do
-        sys.wait(120000)
-        supply.on("led_supply1")
-        supply.on("led_supply2")
-        sys.wait(120000)
+        --sys.wait(120000)
+        --supply.on("led_supply1")
+        --supply.on("led_supply2")
+        --sys.wait(120000)
         
         -- 读取传感器数据
         sensor_485:send_command(do_sat1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
@@ -897,31 +1057,15 @@ sys.taskInit(function()
         sys.wait(1000)
         sensor_485:send_command(do_sat3_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
         sys.wait(1000)
+        sensor_485:send_command(do_sat4_addr, 0x03, string.char(0x00, 0x01, 0x00, 0x06))
+        sys.wait(1000)
         sensor_485:send_command(ph1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
         sys.wait(2000)
-        
-        -- 读取控制板数据
-        ctrl_485:send_command(0x02, 0x03, string.char(0x00, 0x00, 0x00, 0x14))
-        sys.wait(1000)
-        
-        -- 关闭供电
-        supply.off("led_supply1")
-        supply.off("led_supply2")
-        sys.wait(600000)
+       -- 关闭供电
+        --supply.off("led_supply1")
+        --supply.off("led_supply2")
+        --sys.wait(600000)
     end
 end)
-
--- 网络状态监控
-sys.taskInit(function()
-    sys.wait(5000)
-    while true do
-        local status = net_switch.get_network_status()
-        log.info("NET_MONITOR", 
-            string.format("网络状态 - 当前: %s, 以太网: %d, 4G: %d", 
-            status.current, status.ethernet, status.mobile_4g))
-        
-        sys.wait(30000)
-    end
-end)
-
+       
 sys.run()
