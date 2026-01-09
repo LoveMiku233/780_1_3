@@ -17,11 +17,30 @@ local author = "yankai"
 
 libfota2 = require "libfota2"
 
+local FIRMWARE_URL = "http://firmware.dtu.fanzhou.cloud/upgrade"
+
 local _M = {}
 
 local ota_opts = {
 }
 
+
+-- ===========================================================================
+-- @function   update_ok_post()
+-- @brief      向服务器发送更新成功的 POST 请求
+-- @param[in] 
+-- ===========================================================================  
+local function update_ok_post(url, data)
+    local req_headers = {}
+    req_headers["Content-Type"] = "application/json"
+    local body = json.encode(data)
+    local code, headers, body = http.request("POST",url,
+            req_headers,
+            body
+    ).wait()
+    log.info("update http.post", code, headers, body)
+    return code, headers, body
+end
 
 -- ===========================================================================
 -- @function   fota_cb
@@ -32,6 +51,7 @@ local function fota_cb(ret)
     log.info("fota", ret)
     if ret == 0 then
         log.info("升级包下载成功,重启模块")
+        update_ok_post(FIRMWARE_URL, {imei=mobile.imei()})
         rtos.reboot()
     elseif ret == 1 then
         log.info("连接失败", "请检查url拼写或服务器配置(是否为内网)")

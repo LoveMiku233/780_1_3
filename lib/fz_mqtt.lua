@@ -66,7 +66,12 @@ function _M:init()
     if self.config.user == "nil" then
         self.config.user = mobile.imei()
     end
-    self.device_id = mobile.imei() or mcu.unique_id():toHex()
+    if self.config.device_id == "" then
+        self.device_id = mobile.imei() or mcu.unique_id():toHex()
+    else
+        self.device_id = self.config.device_id
+    end
+    
     -- 建立 MQTT 客户端
     self.mqttc = mqtt.create(
         nil, 
@@ -127,7 +132,7 @@ function _M:connect()
     end)
 
     -- 配置连接参数
-    self.mqttc:keepalive(self.config.keepalive or 240)
+    self.mqttc:keepalive(self.config.keepalive or 60)
     self.mqttc:autoreconn(
         self.config.autoreconn ~= false,
         self.config.reconnect_interval or 3000

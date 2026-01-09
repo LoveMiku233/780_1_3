@@ -1,5 +1,5 @@
 PROJECT = "main"
-VERSION = "000.000.300"
+VERSION = "000.000.926"
 author = "yankai"
 
 _G.sys     = require("sys")
@@ -18,67 +18,76 @@ local fzkeys = require("fz_key")
 local fzrelays = require("fz_relay")
 local fzadcs = require("fz_adc")
 local RX8025T = require("RX8025T")
-local rn8302b = require("rn8302b")
 local supply = require("supply")
-local net_switch = require("net_switch")
+local rn8302b = require("rn8302b")
+-- local net_switch = require("net_switch")
+-- 添加本地存储模块
+local db = require("config_manager")
+
 
 -- 485 modbus
 local ctrl_485 = nil
 local sensor_485 = nil
 local display_232 = nil
 local ctrl_cmd_buffer = {}
--- mqtt
-local mqtt1 = fzmqtt.new(config.mqtt)
+-- mqtt - 双平台
+local mqtt1 = fzmqtt.new(config.mqtt)  -- 平台1
+-- 平台2配置
+local ctwing_device_id = string.format("%s%s", config.mqtt2.product_id, mobile.imei())
+local mqtt2 = fzmqtt.new({
+    user = config.mqtt2.user,
+    device_id = ctwing_device_id,
+    password = config.mqtt2.password,
+    host = config.mqtt2.host,
+    port = config.mqtt2.port,
+    ssl = config.mqtt2.ssl,
+    qos = config.mqtt2.qos,
+})
+
 -- imei
 local imei = mobile.imei()
 
--- 订阅发布地址
+-- 订阅发布地址 - 平台1
 local pub_url = "$thing/up/property/"..imei
 local sub_url = "$thing/down/property/"..imei
 
+-- ctwing平台主题 - 平台2
+local ct_pub_url = "sensor_report"
+local ct_sub_url = "cmd_send"
+local response_url = "cmd_response"
+local info_url = "info_report"
+local signal_url = "signal_report"
+local battery_url = "battery_voltage_low_alarm"
+
+-- 设备信息数据
+local info_data = {
+    manufacturer_name = "FANZHOU",
+    terminal_type = "采控一体",
+    module_type = "780控制板",
+    hardware_version = "V1.3",
+    software_version = VERSION,
+    IMEI = imei,
+    ICCID = mobile.iccid(),
+}
+
+-- 信号强度数据
+local signal_data = {
+    rsrp = mobile.rsrp(),
+    rsrq = mobile.rsrq()
+}
+
 -- 传感器地址
 local do_sat1_addr = 0x0c
-local do_sat2_addr = 0x05
-local do_sat3_addr = 0x06
-local do_sat4_addr = 0x07
+local do_sat2_addr = 0x0D
+local do_sat3_addr = 0x0E
+local do_sat4_addr = 0x0F
 local ph1_addr = 0x03
+local ph2_addr = 0x04
+local ph3_addr = 0x05
+local ph4_addr = 0x06
 -- 控制板地址
 local ctrl_addr = 0x02
 local self_addr = 1
-
--- 两片RN8302B芯片的数据
-local rn8302b_chip1_data = {0, 0, 0, 0, 0, 0}
-local rn8302b_chip2_data = {0, 0, 0, 0, 0, 0}
-
--- 缺相检测配置
-local PHASE_UNBALANCE_THRESHOLD_ABS = 2.5 
-local PHASE_GROUP_CONFIG = {
-    {channels = {1, 2, 3}, relay = "k1", chip = 1, fault_key = "fault11"},
-    {channels = {4, 5, 6}, relay = "k2", chip = 1, fault_key = "fault12"},
-    {channels = {1, 2, 3}, relay = "k3", chip = 2, fault_key = "fault13"},
-    {channels = {4, 5, 6}, relay = "k4", chip = 2, fault_key = "fault14"}
-}
-
-local READ_GROUP_CONFIG = {
-    {chip = 1, channels = {1, 2, 3}},
-    {chip = 1, channels = {4, 5, 6}},
-    {chip = 2, channels = {1, 2, 3}},
-    {chip = 2, channels = {4, 5, 6}}
-}
-
-local phase_unbalance_status = {
-    group1 = false,
-    group2 = false, 
-    group3 = false,
-    group4 = false
-}
-
-local power_type_flag = 3  -- 默认两相电
-
-local current_data = {
-    chip1 = {0, 0, 0, 0, 0, 0},
-    chip2 = {0, 0, 0, 0, 0, 0}
-}
 
 local net_config = {
     ethernet = {
@@ -93,8 +102,6 @@ local net_config = {
     }
 }
 
-local is_reconnecting = false
-
 local command_cache = {}
 local CACHE_TIMEOUT = 5 
 
@@ -107,14 +114,95 @@ local CONTROL_MODE = {
 
 -- 继电器操作延时配置
 local RELAY_OPERATION_DELAY = {
-    ON_DELAY = 1000,   -- 打开继电器延时2秒
+    ON_DELAY = 1000,   -- 打开继电器延时1秒
     OFF_DELAY = 1000   -- 关闭继电器延时1秒
 }
 
 -- 当前控制模式，默认为一个传感器控制四个继电器
 local current_control_mode = CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS
 
--- 删除溶解氧自动控制相关配置
+-- 定时任务相关配置
+local new_timers_flag = false
+local timers = {
+    enable = true,
+    on_list = {
+        -- "时间" = 塘口
+    },
+    off_list = {
+        -- "时间" = 塘口
+    }
+}
+
+-- 继电器地址映射
+local sa = {
+    ["sw1"] = {'A', 1},
+    ["sw2"] = {'B', 2},
+    ["sw3"] = {'C', 3},
+    ["sw4"] = {'D', 4},
+}
+
+-- ========== 电流检测和缺相保护相关变量 ==========
+-- 两片RN8302B芯片的数据
+local rn8302b_chip1_data = {0, 0, 0, 0, 0, 0}
+local rn8302b_chip2_data = {0, 0, 0, 0, 0, 0}
+
+-- 缺相检测配置 - 两个芯片共12个通道，分为4组
+local PHASE_UNBALANCE_THRESHOLD_ABS = 1.25  -- 增大阈值到2.0A
+local MIN_CURRENT_THRESHOLD = 0.1          -- 最小有效电流
+local PHASE_GROUP_CONFIG = {
+    {channels = {1, 2, 3}, relay = "k1", chip = 1, fault_key = "fault11"},    -- 第一组：芯片1通道1-3 -> fault11
+    {channels = {4, 5, 6}, relay = "k2", chip = 1, fault_key = "fault12"},    -- 第二组：芯片1通道4-6 -> fault12
+    {channels = {1, 2, 3}, relay = "k3", chip = 2, fault_key = "fault13"},    -- 第三组：芯片2通道1-3 -> fault13
+    {channels = {4, 5, 6}, relay = "k4", chip = 2, fault_key = "fault14"}     -- 第四组：芯片2通道4-6 -> fault14
+}
+
+-- 读取组配置 - 分四次读取，每次读取三个通道
+local READ_GROUP_CONFIG = {
+    {chip = 1, channels = {1, 2, 3}},   -- 第一次：芯片1通道1-3
+    {chip = 1, channels = {4, 5, 6}},   -- 第二次：芯片1通道4-6
+    {chip = 2, channels = {1, 2, 3}},   -- 第三次：芯片2通道1-3
+    {chip = 2, channels = {4, 5, 6}}    -- 第四次：芯片2通道4-6
+}
+
+-- 添加电机启动标志和启动时间记录
+local motor_start_flags = {
+    k1 = 0,  -- 0: 正常状态, 1: 启动中
+    k2 = 0,
+    k3 = 0, 
+    k4 = 0
+}
+
+local motor_start_times = {
+    k1 = 0,  -- 启动时间戳
+    k2 = 0,
+    k3 = 0,
+    k4 = 0
+}
+
+local STARTUP_IGNORE_TIME = 1000  -- 启动后忽略缺相检测的时间(毫秒)
+
+local phase_unbalance_status = {
+    group1 = false,
+    group2 = false, 
+    group3 = false,
+    group4 = false
+}
+
+-- 添加电源类型标志位
+local power_type_flag = 3  -- 默认三相电，2表示两相电，3表示三相电
+
+local current_data = {
+    chip1 = {0, 0, 0, 0, 0, 0},
+    chip2 = {0, 0, 0, 0, 0, 0}
+}
+
+-- 继电器状态变化跟踪
+local last_relay_states = {
+    k1 = 0,
+    k2 = 0,
+    k3 = 0,
+    k4 = 0
+}
 
 local multi_sensor_data = {
     water_temp1 = 0.0,
@@ -126,6 +214,9 @@ local multi_sensor_data = {
     do_sat3 = 0.0,
     do_sat4 = 0.0,
     ph1 = 0.0,
+    ph2 = 0.0,
+    ph3 = 0.0,
+    ph4 = 0.0,
     sw11 = 0,
     sw12 = 0,
     sw13 = 0,
@@ -230,88 +321,648 @@ if wdt then
     sys.timerLoopStart(wdt.feed, 3000)
 end
 
--- ========== 控制模式设置函数 ==========
--- 设置控制模式
-function set_control_mode(mode)
-    if mode == CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS or 
-       mode == CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY or
-       mode == CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS or
-       mode == CONTROL_MODE.THREE_SENSORS_CONTROL_FOUR_RELAYS then
+-- ==========电流检测和缺相保护函数 ==========
+-- ========== 电机启动检测函数 ==========
+function check_motor_start()
+    local current_time = os.time() * 1000  -- 转换为毫秒
+    
+    -- 检查每个继电器的状态变化
+    for _, relay_name in ipairs({"k1", "k2", "k3", "k4"}) do
+        local current_state = fzrelays.get_mode(relay_name)
         
-        current_control_mode = mode
-        multi_sensor_data.control_mode = mode
-        modbus_holding_registers[0x0018] = mode
-        
-        local mode_description = ""
-        if mode == CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS then
-            mode_description = "一个传感器控制四个继电器"
-        elseif mode == CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY then
-            mode_description = "一个传感器控制一个继电器"
-        elseif mode == CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS then
-            mode_description = "两个传感器控制四个继电器（传感器1控制K1K2，传感器2控制K3K4）"
-        elseif mode == CONTROL_MODE.THREE_SENSORS_CONTROL_FOUR_RELAYS then
-            mode_description = "三个传感器控制四个继电器（传感器1控制K1，传感器2控制K2，传感器3控制K3K4）"
+        -- 如果状态从0变为1，表示电机启动
+        if current_state == 1 and last_relay_states[relay_name] == 0 then
+            motor_start_flags[relay_name] = 1
+            motor_start_times[relay_name] = current_time
+            log.info("MOTOR_START", string.format("检测到电机 %s 启动，设置启动标志", relay_name))
+            
+            -- 启动后立即标记故障为0，避免误报
+            local fault_key = "fault1" .. string.sub(relay_name, 2)
+            multi_sensor_data[fault_key] = 0
+            
+            -- 更新缺相状态
+            local group_index = tonumber(string.sub(relay_name, 2))
+            if group_index then
+                phase_unbalance_status["group" .. group_index] = false
+            end
         end
         
-        log.info("CONTROL_MODE", string.format("控制模式已设置为: %s", mode_description))
+        -- 检查是否超过启动忽略时间
+        if motor_start_flags[relay_name] == 1 then
+            local elapsed_time = current_time - motor_start_times[relay_name]
+            if elapsed_time >= STARTUP_IGNORE_TIME then
+                motor_start_flags[relay_name] = 0
+                log.info("MOTOR_START", string.format("电机 %s 启动完成，已过 %d 毫秒，恢复正常检测", relay_name, elapsed_time))
+            end
+        end
         
-        -- 上报模式变化
-        update_changed_data({control_mode = mode})
-        
+        -- 更新最后状态
+        last_relay_states[relay_name] = current_state
+    end
+end
+
+-- 添加设置电源类型的函数
+function set_power_type(power_type)
+    if power_type == 2 or power_type == 3 then
+        power_type_flag = power_type
+        multi_sensor_data.power_type = power_type
+        log.info("POWER_TYPE", string.format("电源类型设置为: %d相电", power_type))
+        -- 立即上报电源类型变化
+        update_changed_data({power_type = power_type})
         return true
     else
-        log.error("CONTROL_MODE", "无效的控制模式:", mode)
+        log.error("POWER_TYPE", "无效的电源类型:", power_type)
         return false
     end
 end
 
--- 解析控制模式设置指令
-function parse_control_mode_command(data)
-    local bytes = {data:byte(1, #data)}
+function check_phase_unbalance_c_style(group_config, chip1_data, chip2_data, group_index)
+    local currents = {}
+    local chip_data = (group_config.chip == 1) and chip1_data or chip2_data
     
-    -- 检查指令格式: FA 02 XX FE
-    if bytes[1] == 0xFA and bytes[2] == 0x02 and bytes[4] == 0xFE then
-        local mode = bytes[3]
+    if not chip_data then
+        return false
+    end
+    
+    -- 获取对应芯片的三个通道电流
+    for i, channel in ipairs(group_config.channels) do
+        currents[i] = chip_data[channel] or 0
+    end
+    
+    local current1 = currents[1]
+    local current2 = currents[2] 
+    local current3 = currents[3]
+    
+    -- 如果所有通道电流都很小，认为没有负载，不进行缺相判断
+    if current1 < 0.05 and current2 < 0.05 and current3 < 0.05 then
+        return false
+    end
+    
+    -- 根据电源类型进行不同的检测
+    local is_unbalanced = false
+    
+    if power_type_flag == 3 then
+        -- 三相电检测：直接比较三相电流之间的差值
+        is_unbalanced = (math.abs(current1 - current2) > PHASE_UNBALANCE_THRESHOLD_ABS) or
+                       (math.abs(current1 - current3) > PHASE_UNBALANCE_THRESHOLD_ABS) or
+                       (math.abs(current2 - current3) > PHASE_UNBALANCE_THRESHOLD_ABS)
         
-        if mode == 0x01 then
-            -- 设置为一个传感器控制四个继电器模式
-            set_control_mode(CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS)
-            return true
-        elseif mode == 0x02 then
-            -- 设置为一个传感器控制一个继电器模式
-            set_control_mode(CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY)
-            return true
-        elseif mode == 0x03 then
-            -- 设置为两个传感器控制四个继电器模式
-            set_control_mode(CONTROL_MODE.TWO_SENSORS_CONTROL_FOUR_RELAYS)
-            return true
-        elseif mode == 0x04 then
-            -- 设置为三个传感器控制四个继电器模式
-            set_control_mode(CONTROL_MODE.THREE_SENSORS_CONTROL_FOUR_RELAYS)
-            return true
+        log.info("PHASE_CHECK_3PHASE", string.format("三相电-组%d: 电流[%.3fA, %.3fA, %.3fA]", 
+            group_index, current1, current2, current3))
+    else
+        -- 两相电检测：检测任意两相之间的电流差值
+        -- 计算所有两两组合的电流差值
+        local diff12 = math.abs(current1 - current2)
+        local diff13 = math.abs(current1 - current3) 
+        local diff23 = math.abs(current2 - current3)
+        
+        -- 两相电的缺相判断：任意两相之间的电流差值超过阈值
+        is_unbalanced = (diff12 > PHASE_UNBALANCE_THRESHOLD_ABS) or
+                       (diff13 > PHASE_UNBALANCE_THRESHOLD_ABS) or
+                       (diff23 > PHASE_UNBALANCE_THRESHOLD_ABS)
+        
+        -- 记录哪两相之间出现了不平衡
+        local unbalanced_pairs = {}
+        if diff12 > PHASE_UNBALANCE_THRESHOLD_ABS then table.insert(unbalanced_pairs, "1-2") end
+        if diff13 > PHASE_UNBALANCE_THRESHOLD_ABS then table.insert(unbalanced_pairs, "1-3") end
+        if diff23 > PHASE_UNBALANCE_THRESHOLD_ABS then table.insert(unbalanced_pairs, "2-3") end
+        
+        log.info("PHASE_CHECK_2PHASE", string.format("两相电-组%d: 电流[%.3fA, %.3fA, %.3fA] 差值[%.3f,%.3f,%.3f] 不平衡相位:%s", 
+            group_index, current1, current2, current3, diff12, diff13, diff23,
+            table.concat(unbalanced_pairs, ",")))
+    end
+    
+    -- 记录详细的检测信息
+    log.info("PHASE_CHECK_C_STYLE", string.format("组%d: 差值[%.3f, %.3f, %.3f] 阈值:%.3f 缺相:%s", 
+        group_index, 
+        math.abs(current1 - current2), 
+        math.abs(current1 - current3), 
+        math.abs(current2 - current3),
+        PHASE_UNBALANCE_THRESHOLD_ABS,
+        is_unbalanced and "是" or "否"))
+    
+    return is_unbalanced
+end
+
+function execute_phase_protection_c_style()
+    if not rn8302b_chip1_data and not rn8302b_chip2_data then
+        return
+    end
+    
+    -- 先检查电机启动状态
+    check_motor_start()
+    
+    -- 检查四个三相组
+    for i, group_config in ipairs(PHASE_GROUP_CONFIG) do
+        -- 检查该组对应的电机是否处于启动状态
+        local relay_name = group_config.relay
+        local is_starting = (motor_start_flags[relay_name] == 1)
+        
+        if is_starting then
+            -- 电机启动中，跳过缺相检测
+            local elapsed_time = (os.time() * 1000) - motor_start_times[relay_name]
+            log.info("PHASE_PROTECTION", string.format("组%d对应电机 %s 启动中(已运行 %d 毫秒)，跳过缺相检测", 
+                i, relay_name, elapsed_time))
+            
+            -- 保持故障状态为0（正常）
+            local fault_key = group_config.fault_key
+            multi_sensor_data[fault_key] = 0
+            phase_unbalance_status["group" .. i] = false
         else
-            log.warn("CONTROL_MODE", "未知的控制模式指令:", string.format("%02X", mode))
+            -- 正常状态，进行缺相检测
+            local is_unbalanced = check_phase_unbalance_c_style(group_config, rn8302b_chip1_data, rn8302b_chip2_data, i)
+            local status_key = "phase_unbalance" .. i
+            local relay_key = "sw1" .. i
+            local fault_key = group_config.fault_key
+            
+            -- 更新缺相状态
+            local old_status = phase_unbalance_status["group" .. i]
+            phase_unbalance_status["group" .. i] = is_unbalanced
+            
+            -- 更新fault状态：缺相时置1，正常时置0
+            multi_sensor_data[fault_key] = is_unbalanced and 1 or 0
+            
+            -- 如果检测到缺相，执行保护
+            if is_unbalanced then
+                -- 获取继电器当前状态
+                local current_relay_state = fzrelays.get_mode(group_config.relay)
+                
+                -- 如果继电器是闭合状态，则断开
+                if current_relay_state == 1 then
+                    log.warn("PHASE_PROTECTION_C", string.format("芯片%d组%d检测到缺相，断开继电器%s", 
+                        group_config.chip, i, group_config.relay))
+                    
+                    -- 断开继电器
+                    fzrelays.set_mode(group_config.relay, "off")
+                    dis_func.set_fault_code(1)
+                    -- 更新继电器状态到数据结构
+                    multi_sensor_data[relay_key] = 0
+                    
+                    -- 记录保护动作
+                    log.error("PHASE_PROTECTION_ACTION_C", 
+                        string.format("缺相保护动作：断开%s，组%d电流异常", group_config.relay, i))
+                end
+            end
+            
+            -- 状态发生变化时上报
+            if is_unbalanced ~= old_status then
+                -- 上报所有fault
+                for j = 1, 4 do
+                    local fault_key = "fault1"..j
+                    update_changed_data({[fault_key] = multi_sensor_data[fault_key]})
+                end
+            end
+        end
+    end
+end
+
+-- RN8302B电流监测任务 - 分四次读取，每次读取三个通道
+sys.taskInit(function()
+    
+    sys.wait(200)
+    
+    local read_cycle = 0
+    local current_read_group = 1  -- 当前读取组索引
+    
+    while true do
+        read_cycle = read_cycle + 1
+        
+        -- 获取当前读取组的配置
+        local group_config = READ_GROUP_CONFIG[current_read_group]
+        
+        if group_config then
+            log.info("RN8302B_READ", string.format("第%d次读取: 芯片%d通道%d-%d", 
+                current_read_group, group_config.chip, 
+                group_config.channels[1], group_config.channels[3]))
+            
+            -- 读取当前组的三个通道
+            local currents = {}
+            for i, channel in ipairs(group_config.channels) do
+                currents[channel] = rn8302b.read_single_current(group_config.chip, channel)
+                sys.wait(100)  -- 每个通道读取间隔
+            end
+            
+            -- 更新对应芯片的数据
+            if group_config.chip == 1 then
+                for channel, value in pairs(currents) do
+                    rn8302b_chip1_data[channel] = value
+                end
+                -- 更新到current_data用于历史比较
+                for channel, value in pairs(currents) do
+                    current_data.chip1[channel] = value
+                end
+            else
+                for channel, value in pairs(currents) do
+                    rn8302b_chip2_data[channel] = value
+                end
+                -- 更新到current_data用于历史比较
+                for channel, value in pairs(currents) do
+                    current_data.chip2[channel] = value
+                end
+            end
+            
+            -- 更新到传感器数据结构中
+            if group_config.chip == 1 then
+                if current_read_group == 1 then
+                    -- 第一次读取：芯片1通道1-3，更新current11
+                    multi_sensor_data.current11 = currents[1] or 0
+                elseif current_read_group == 2 then
+                    -- 第二次读取：芯片1通道4-6，更新current12
+                    multi_sensor_data.current12 = currents[4] or 0
+                end
+            else
+                if current_read_group == 3 then
+                    -- 第三次读取：芯片2通道1-3，更新current13
+                    multi_sensor_data.current13 = currents[1] or 0
+                elseif current_read_group == 4 then
+                    -- 第四次读取：芯片2通道4-6，更新current14
+                    multi_sensor_data.current14 = currents[4] or 0
+                end
+            end
+            
+            log.info("RN8302B_GROUP", string.format("组%d读取完成", current_read_group))
+            
+            -- 移动到下一组
+            current_read_group = current_read_group + 1
+            if current_read_group > 4 then
+                current_read_group = 1
+                
+                -- 缺相检测（包含启动跳过逻辑）
+                execute_phase_protection_c_style()
+                
+                -- 每5个周期完整记录一次日志
+                if read_cycle % 5 == 0 then
+                    log.info("RN8302B_FULL", "芯片1电流数据:", 
+                        string.format("[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]A", 
+                        rn8302b_chip1_data[1] or 0, rn8302b_chip1_data[2] or 0, 
+                        rn8302b_chip1_data[3] or 0, rn8302b_chip1_data[4] or 0,
+                        rn8302b_chip1_data[5] or 0, rn8302b_chip1_data[6] or 0))
+                    log.info("RN8302B_FULL", "芯片2电流数据:", 
+                        string.format("[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]A", 
+                        rn8302b_chip2_data[1] or 0, rn8302b_chip2_data[2] or 0, 
+                        rn8302b_chip2_data[3] or 0, rn8302b_chip2_data[4] or 0,
+                        rn8302b_chip2_data[5] or 0, rn8302b_chip2_data[6] or 0))
+                    
+                    -- 记录缺相状态和对应的fault值
+                    log.info("PHASE_STATUS", string.format("缺相状态: 组1:%s(fault11=%d) 组2:%s(fault12=%d) 组3:%s(fault13=%d) 组4:%s(fault14=%d)",
+                        phase_unbalance_status.group1 and "异常" or "正常", multi_sensor_data.fault11,
+                        phase_unbalance_status.group2 and "异常" or "正常", multi_sensor_data.fault12, 
+                        phase_unbalance_status.group3 and "异常" or "正常", multi_sensor_data.fault13,
+                        phase_unbalance_status.group4 and "异常" or "正常", multi_sensor_data.fault14))
+                    
+                    -- 记录当前电源类型
+                    log.info("POWER_TYPE_STATUS", string.format("当前电源类型: %d相电", power_type_flag))
+                    
+                    -- 记录电机启动状态
+                    for _, relay in ipairs({"k1", "k2", "k3", "k4"}) do
+                        if motor_start_flags[relay] == 1 then
+                            local elapsed = (os.time() * 1000) - motor_start_times[relay]
+                            log.info("MOTOR_STATUS", string.format("电机 %s 启动中，已运行 %d 毫秒", relay, elapsed))
+                        end
+                    end
+                else
+                    log.info("RN8302B", "一轮完整读取完成")
+                end
+            end
+        end 
+        sys.wait(200)  -- 组间读取间隔
+    end
+end)
+
+-- ========== 双平台MQTT处理函数 ==========
+-- 平台1数据解析
+function platform1_parse(data)
+    log.info("PLATFORM1", "收到平台1数据:", data)
+    
+    local json_data = json.decode(data)
+    if json_data == nil then
+        log.warn("PLATFORM1", "JSON解析失败")
+        return
+    end
+    
+    -- 处理定时配置
+    if json_data.timer then
+        process_timer_config(json_data.timer)
+        return
+    end
+    
+    -- 处理控制模式设置
+    if json_data.control_mode then
+        handle_control_mode_setting(json_data)
+        return
+    end
+    
+    -- 原有的控制命令处理
+    process_control_command(json_data, "platform1")
+end
+
+-- 平台2数据解析
+function platform2_parse(data)
+    log.info("PLATFORM2", "收到平台2数据:", data)
+    
+    -- ctwing平台特有的任务响应格式
+    if string.match(data, "taskId") then
+        local json_data = json.decode(data)
+        if json_data == nil or json_data.payload == nil then
+            return
+        end
+        
+        -- 处理控制命令
+        process_control_command(json_data.payload, "platform2")
+        
+        -- 回复ctwing平台
+        local response = {
+            ["taskId"] = json_data.taskId,
+            ["resultPayload"] = json_data.payload
+        }
+        
+        log.info("CTWING_RESPONSE", json.encode(response))
+        if mqtt2 and mqtt2:get_is_connected() then
+            mqtt2:publish(response_url, json.encode(response), 0)
+        end
+    else
+        -- 普通控制命令
+        local json_data = json.decode(data)
+        if json_data then
+            process_control_command(json_data, "platform2")
+        end
+    end
+end
+
+-- 信号强度和电池电压上报函数
+function update_signal_battery_data()
+    local info_data_str = json.encode(info_data)
+    log.info("CTWING_INFO", "上报设备信息到平台2:", info_data_str)
+
+    signal_data.rsrp = mobile.rsrp()
+    signal_data.rsrq = mobile.rsrq()
+    local signal_data_str = json.encode(signal_data)
+    log.info("CTWING_SIGNAL", "上报信号强度到平台2:", signal_data_str)
+    
+    mqtt2:publish(signal_url, signal_data_str, 0)
+    mqtt2:publish(info_url, info_data_str, 0)
+end
+
+-- ========== 定时任务相关函数 ==========
+-- 定时任务检查函数
+function timer_task()
+    local now_time = os.date("*t")
+    log.info("TIMER_TASK", string.format("当前时间: %02d:%02d", now_time.hour, now_time.min))
+    
+    -- 检查定时任务是否启用
+    if not timers.enable then
+        log.debug("TIMER_TASK", "定时任务未启用")
+        return
+    end
+    
+    -- 处理开启任务
+    for idx, timer in ipairs(timers.on_list) do
+        log.debug("TIMER_CHECK", string.format("检查开启任务: 继电器%d %02d:%02d", 
+                 timer.id, timer.hour, timer.min))
+        
+        if timer.hour == now_time.hour and timer.min == now_time.min then
+            log.info("TIMER_ON", string.format("执行定时开启: 继电器 sw1%d", timer.id))
+            
+            -- 使用协程执行继电器操作
+            sys.taskInit(function()
+                timer_control_relay(timer.id, "on")
+            end)
         end
     end
     
-    return false
+    -- 处理关闭任务
+    for idx, timer in ipairs(timers.off_list) do
+        log.debug("TIMER_CHECK", string.format("检查关闭任务: 继电器%d %02d:%02d", 
+                 timer.id, timer.hour, timer.min))
+        
+        if timer.hour == now_time.hour and timer.min == now_time.min then
+            log.info("TIMER_OFF", string.format("执行定时关闭: 继电器 sw1%d", timer.id))
+            
+            -- 使用协程执行继电器操作
+            sys.taskInit(function()
+                timer_control_relay(timer.id, "off")
+            end)
+        end
+    end
 end
 
--- 修改232屏幕数据解析函数，移除自动控制相关解析
+function timer_control_relay(relay_id, action)
+    local relay_key = "sw1" .. tostring(relay_id)
+    local relay_name = relay_map[relay_key]
+    
+    if not relay_name then
+        log.error("TIMER_ERROR", "未知的继电器:", relay_key)
+        return
+    end
+
+    -- 检查当前状态，避免重复操作
+    local current_state = fzrelays.get_mode(relay_name)
+    local target_state = action
+    local target_value = action == "on" and 1 or 0
+    
+    log.info("TIMER_STATE", string.format("继电器 %s 当前状态: %s, 目标状态: %s", 
+             relay_name, current_state, target_state))
+    
+    if (current_state == 1 and target_value == 1) or (current_state == 0 and target_value == 0) then
+        log.info("TIMER_SKIP", string.format("继电器 %s 已处于目标状态，跳过", relay_name))
+        return
+    end
+    
+    log.info("TIMER_ACTION", string.format("%s继电器 %s", action, relay_name))
+    
+    -- 根据操作类型添加延时
+    if action == "on" then
+        sys.wait(RELAY_OPERATION_DELAY.ON_DELAY)
+    else
+        sys.wait(RELAY_OPERATION_DELAY.OFF_DELAY)
+    end
+    
+    -- 控制继电器
+    fzrelays.set_mode(relay_name, target_state)
+    
+    -- 等待继电器稳定
+    sys.wait(1000)
+    
+    -- 重新读取实际状态
+    local state_value = fzrelays.get_mode(relay_name)
+    
+
+    -- 更新状态数据
+    multi_sensor_data[relay_key] = state_value
+    
+    -- 立即同步到屏幕
+    send_full_status_to_screen()
+    
+    -- 上报状态变化到双平台
+    local report_success = false
+    local report_attempts = 0
+    
+    while not report_success and report_attempts < 3 do
+        report_attempts = report_attempts + 1
+        
+        -- 直接构造上报数据
+        local report_data = {
+            [relay_key] = state_value,
+        }
+        
+        local report_str = json.encode(report_data)
+        log.info("TIMER_REPORT", string.format("尝试上报定时任务结果(第%d次): %s", report_attempts, report_str))
+        
+        if (mqtt1 and mqtt1:get_is_connected()) or (mqtt2 and mqtt2:get_is_connected()) then
+            -- 上报到平台1
+            if mqtt1 and mqtt1:get_is_connected() then
+                local publish_result = mqtt1:publish(pub_url, report_str, 0)
+                if publish_result then
+                    log.info("TIMER_REPORT_SUCCESS", "定时任务状态上报平台1成功")
+                else
+                    log.warn("TIMER_REPORT_FAIL", "定时任务状态上报平台1失败")
+                end
+            end
+            
+            -- 上报到平台2
+            if mqtt2 and mqtt2:get_is_connected() then
+                local publish_result = mqtt2:publish(ct_pub_url, report_str, 0)
+                if publish_result then
+                    log.info("TIMER_REPORT_SUCCESS", "定时任务状态上报平台2成功")
+                else
+                    log.warn("TIMER_REPORT_FAIL", "定时任务状态上报平台2失败")
+                end
+            end
+            
+            report_success = true
+        else
+            log.warn("TIMER_REPORT", "MQTT未连接，等待重试")
+            sys.wait(2000)
+        end
+    end
+    
+    if not report_success then
+        log.error("TIMER_REPORT", "定时任务状态上报完全失败")
+        -- 将变化数据缓存，等待下次连接时上报
+        update_changed_data({[relay_key] = state_value})
+    end
+    log.info("TIMER_SUCCESS", string.format("成功%s继电器 %s", action, relay_name))
+end
+
+-- 处理定时配置
+function process_timer_config(timer_data)
+    log.info("TIMER_CONFIG", "收到定时配置:", type(timer_data) == "table" and json.encode(timer_data) or timer_data)
+    
+    -- 如果timer_data是字符串，尝试解析JSON
+    if type(timer_data) == "string" then
+        local success, parsed = pcall(json.decode, timer_data)
+        if success then
+            timer_data = parsed
+            log.info("TIMER_CONFIG", "解析字符串定时配置成功")
+        else
+            log.error("TIMER_CONFIG", "解析定时配置字符串失败:", timer_data)
+            return
+        end
+    end
+    
+    if timer_data == "reset" then
+        -- 重置定时配置
+        timers.on_list = {}
+        timers.off_list = {}
+        timers.enable = false
+        db.update("timers", timers)
+        log.info("TIMER_CONFIG", "定时配置已重置")
+        
+        -- 发送确认消息到双平台
+        local response_data = json.encode({timer = "reset ok"})
+        if mqtt1 and mqtt1:get_is_connected() then
+            mqtt1:publish(pub_url, response_data, 0)
+        end
+        if mqtt2 and mqtt2:get_is_connected() then
+            mqtt2:publish(ct_pub_url, response_data, 0)
+        end
+        return
+    end
+    
+    -- 解析定时配置
+    if type(timer_data) == "table" then
+        timers.on_list = {}
+        timers.off_list = {}
+        timers.enable = true
+        
+        for key, val in pairs(timer_data) do
+            -- 支持格式: "11_1357" 表示继电器1在13:57
+            -- 格式说明: [第一个数字固定为1][继电器编号]_[小时][分钟]
+            local id_part, time_part = string.match(key, "^(%d+)_(%d+)$")
+            
+            if id_part and time_part then
+                -- 解析继电器编号 (取第二位数字)
+                local id_num = nil
+                if #id_part == 2 then
+                    id_num = tonumber(string.sub(id_part, 2, 2))
+                else
+                    -- 如果只有一位数字，直接使用
+                    id_num = tonumber(id_part)
+                end
+                
+                -- 解析时间
+                local hour_num = tonumber(string.sub(time_part, 1, 2))
+                local min_num = tonumber(string.sub(time_part, 3, 4))
+                
+                if id_num and hour_num and min_num and id_num >= 1 and id_num <= 4 then
+                    local timer_entry = {id = id_num, hour = hour_num, min = min_num}
+                    
+                    if val == 1 then
+                        table.insert(timers.on_list, timer_entry)
+                        log.info("TIMER_ADD", string.format("添加开启定时: 继电器%d %02d:%02d", 
+                                id_num, hour_num, min_num))
+                    elseif val == 0 then
+                        table.insert(timers.off_list, timer_entry)
+                        log.info("TIMER_ADD", string.format("添加关闭定时: 继电器%d %02d:%02d", 
+                                id_num, hour_num, min_num))
+                    else
+                        log.warn("TIMER_CONFIG", "无效的定时动作值:", key, val)
+                    end
+                else
+                    log.warn("TIMER_CONFIG", "无效的定时配置参数:", key, val, "继电器ID:", id_num, "时间:", hour_num, ":", min_num)
+                end
+            else
+                log.warn("TIMER_CONFIG", "格式错误的定时配置:", key)
+            end
+        end
+        
+        -- 保存配置
+        db.update("timers", timers)
+        log.info("TIMER_CONFIG", "定时配置已更新并保存")
+        log.info("TIMER_CONFIG", "开启任务数量:", #timers.on_list)
+        log.info("TIMER_CONFIG", "关闭任务数量:", #timers.off_list)
+        
+        -- 打印所有定时任务
+        for i, timer in ipairs(timers.on_list) do
+            log.info("TIMER_ON_DETAIL", string.format("开启任务%d: 继电器%d %02d:%02d", 
+                    i, timer.id, timer.hour, timer.min))
+        end
+        for i, timer in ipairs(timers.off_list) do
+            log.info("TIMER_OFF_DETAIL", string.format("关闭任务%d: 继电器%d %02d:%02d", 
+                    i, timer.id, timer.hour, timer.min))
+        end
+        
+        -- 发送确认消息到双平台
+        local response_data = json.encode({timer = "sync ok"})
+        if mqtt1 and mqtt1:get_is_connected() then
+            mqtt1:publish(pub_url, response_data, 0)
+        end
+        if mqtt2 and mqtt2:get_is_connected() then
+            mqtt2:publish(ct_pub_url, response_data, 0)
+        end
+    else
+        log.error("TIMER_CONFIG", "无效的定时配置数据类型:", type(timer_data))
+    end
+end
+
+
+-- 232屏幕数据解析函数
 function display_232_parse(data)
     -- 记录原始数据
     log.info("DISPLAY_232_RAW", "收到原始数据(hex):", data:toHex())
     log.info("DISPLAY_232_RAW", "收到原始数据长度:", #data)
     
-    -- 检查是否是控制模式设置指令
-    if #data == 4 then
-        local success = parse_control_mode_command(data)
-        if success then
-            log.info("CONTROL_MODE", "成功解析控制模式设置指令")
-            return
-        end
-    end
-    
+
     -- 原有的JSON解析逻辑
     local clean_data = data:gsub("[\0\r\n]", ""):gsub("^%s+", ""):gsub("%s+$", "")
     if #clean_data > 0 then
@@ -348,40 +999,6 @@ function display_232_parse(data)
     else
         log.warn("DISPLAY_232", "Modbus RTU解析失败")
     end
-end
-
--- 处理控制模式设置
-function handle_control_mode_setting(control_data)
-    log.info("CONTROL_MODE", "收到控制模式设置:", json.encode(control_data))
-    
-    if control_data.mode then
-        local mode = tonumber(control_data.mode)
-        if mode == CONTROL_MODE.ONE_SENSOR_CONTROL_FOUR_RELAYS or mode == CONTROL_MODE.ONE_SENSOR_CONTROL_ONE_RELAY then
-            set_control_mode(mode)
-        else
-            log.error("CONTROL_MODE", "无效的控制模式值:", mode)
-        end
-    end
-end
-
--- 修改云平台数据解析函数，移除自动控制相关处理
-function cloud_parse(data)
-    log.info("CLOUD", "收到云平台数据:", data)
-    
-    local json_data = json.decode(data)
-    if json_data == nil then
-        log.warn("CLOUD", "JSON解析失败")
-        return
-    end
-    
-    -- 处理控制模式设置
-    if json_data.control_mode then
-        handle_control_mode_setting(json_data.control_mode)
-        return
-    end
-    
-    -- 原有的控制命令处理
-    process_control_command(json_data, "cloud")
 end
 
 -- 修正发送完整状态到屏幕函数
@@ -450,17 +1067,14 @@ function send_full_status_to_screen()
     local crc = calculate_modbus_crc(frame_without_crc)
     local modbus_frame = frame_without_crc .. string.char(bit.band(crc, 0xFF), bit.rshift(crc, 8))
     
-     display_232:send_str(modbus_frame)
+    display_232:send_str(modbus_frame)
 end
 
 -- 1. 初始化串口和硬件
 sys.taskInit(function()
     log.info("main", "start init uart")
     -- 初始化485
-    --gpio.setup(16, 1)
-    gpio.setup(27, 1)
-    gpio.setup(22, 1)
-    sensor_485 = fzmodbus.new({uartid=2, gpio_485=23, is_485=1, baudrate=9600})
+    sensor_485 = fzmodbus.new({uartid=1, gpio_485=16, is_485=1, baudrate=9600})
     --ctrl_485 = fzmodbus.new({is_485=1, uartid=2, gpio_485=28, baudrate=9600})
     display_232 = fzmodbus.new({uartid=3, baudrate=115200})
     
@@ -469,151 +1083,96 @@ sys.taskInit(function()
     fzkeys.init()
     bme.init()
     fzadcs.init(0, 4.0)
-    rn8302b.init()
     supply.init()
+     -- 初始化RN8302B（增加采样次数）
+    rn8302b.init()
     
     log.info("UART", "232显示屏接口初始化完成")
     send_full_status_to_screen()
 end)
 
--- 2. 网络切换初始化
+-- 3. 双平台MQTT和FOTA初始化
 sys.taskInit(function()
-    sys.wait(3000)
-        
-    log.info("main", "开始初始化网络切换...")
-        
-    local success = net_switch.init(net_config, network_status_callback)
-    if not success then
-        log.error("main", "网络切换初始化失败")
-        return
-    end
-        
-    log.info("main", "网络切换初始化完成，等待网络就绪...")
-        sys.waitUntil("IP_READY", 30000)
-        log.info("main", "网络已就绪，开始业务初始化...")
-end)
-
--- 3. MQTT和FOTA初始化
-sys.taskInit(function()
-    -- 等待网络连接
-    local network_wait_start = os.time()
-    while not net_switch.is_connected() do
-        if os.time() - network_wait_start > 60 then
-            log.warn("MQTT", "等待网络超时，尝试继续初始化")
-            break
-        end
-        log.info("MQTT", "等待网络连接...")
-        sys.wait(2000)
-    end
-    
-    log.info("MQTT", "开始初始化MQTT...")
+    sys.waitUntil("IP_READY")
+    log.info("MQTT", "开始初始化双平台MQTT...")
     
     -- 更新配置
     config.mqtt.device_id = string.format("%s%s", config.mqtt.product_id, mobile.imei())
     config.update_url = string.format("###%s?imei=%s&productKey=%s&core=%s&version=%s", 
     config.FIRMWARE_URL, mobile.imei(), config.PRODUCT_KEY, rtos.version(), VERSION)
     
+    -- 初始化FOTA
+    log.info("FOTA", "开始固件更新检查")
+    fzfota.init(config)
+    fzfota.print_version()
+    fzfota.start_timer_update()
     
-    -- 初始化MQTT
-    mqtt1 = fzmqtt.new(config.mqtt)
+    -- 初始化平台1 MQTT
+    mqtt1:init() 
+    mqtt1:connect()
+    sys.waitUntil(mqtt1:get_instance_id().."CONNECTED")
+    mqtt1:subscribe(sub_url, 0, platform1_parse)
+
+    -- 初始化平台2 MQTT
+    mqtt2:init()
+    mqtt2:connect()
+    sys.waitUntil(mqtt2:get_instance_id().."CONNECTED")
+    mqtt2:subscribe(ct_sub_url, 0, platform2_parse)
     
-    local mqtt_init_success = false
-    local init_attempts = 0
+    -- 上报设备信息到平台2
+    update_signal_battery_data()
     
-    while not mqtt_init_success and init_attempts < 3 do
-        init_attempts = init_attempts + 1
-        
-        if mqtt1:init() then
-            if mqtt1:connect() then
-                local mqtt_start = os.time()
-                while os.time() - mqtt_start < 20 do
-                    if mqtt1:get_is_connected() then
-                        log.info("MQTT", "MQTT连接成功")
-                        
-                        local sub_ok = mqtt1:subscribe(sub_url, 0, cloud_parse)
-                        if sub_ok then
-                            log.info("MQTT", "订阅主题成功:", sub_url)
-                            mqtt_init_success = true
-                            
-                            -- 上报完整设备状态
-                            sys.wait(2000)
-                            update_changed_data(multi_sensor_data)
-                            break
-                        else
-                            log.error("MQTT", "订阅主题失败")
-                        end
-                    end
-                    sys.wait(1000)
-                end
-            end
-        end
-        
-        if not mqtt_init_success then
-            log.warn("MQTT", "MQTT初始化失败，5秒后重试")
-            sys.wait(5000)
-        end
-    end
-    
-    if not mqtt_init_success then
-        log.error("MQTT", "MQTT初始化完全失败")
-    end
+    log.info("MQTT", "双平台MQTT初始化完成")
 end)
 
--- 网络状态回调
-function network_status_callback(event_type, data)
-    if event_type == "ethernet" then
-        if data == 2 then
-            log.info("NET_CALLBACK", "以太网连接成功")
-        elseif data == 0 then
-            log.warn("NET_CALLBACK", "以太网连接断开")
+-- 重启后状态上报任务
+sys.taskInit(function()
+    -- 等待系统基本初始化完成
+    sys.wait(5000)
+    
+    -- 等待MQTT连接
+    local mqtt_wait_start = os.time()
+    while (mqtt1 and not mqtt1:get_is_connected()) and (mqtt2 and not mqtt2:get_is_connected()) do
+        if os.time() - mqtt_wait_start > 30 then
+            log.warn("REBOOT_REPORT", "等待MQTT连接超时")
+            break
         end
-    elseif event_type == "4g" then
-        if data == 2 then
-            log.info("NET_CALLBACK", "4G网络连接成功")
-        elseif data == 0 then
-            log.warn("NET_CALLBACK", "4G网络连接断开")
-        end
-    elseif event_type == "switch" then
-        log.info("NET_CALLBACK", "网络切换到:", data)
-        
-        if data ~= "none" then
-            sys.taskInit(function()
-                sys.wait(3000)
-                
-                if mqtt1 then
-                    log.info("MQTT_RECONNECT", "网络切换，重启MQTT连接...")
-                    
-                    mqtt1:close()
-                    sys.wait(2000)
-                    
-                    mqtt1:init()
-                    mqtt1:connect()
-                    log.info("FOTA", "开始固件更新检查")
-                    fzfota.init(config)
-                    fzfota.print_version()
-                    fzfota.start_timer_update()
-                    local mqtt_start = os.time()
-                    local reconnect_success = false
-                    
-                    while os.time() - mqtt_start < 30 do
-                        if mqtt1:get_is_connected() then
-                            log.info("MQTT_RECONNECT", "MQTT重新连接成功")
-                            
-                            -- 重新订阅主题
-                            mqtt1:subscribe(sub_url, 0, cloud_parse)
-                            
-                            sys.wait(1000)
-                            update_changed_data(multi_sensor_data)
-                            reconnect_success = true
-                            break
-                        end
-                        sys.wait(1000)
-                    end
-                end
-            end)
-        end
+        log.info("REBOOT_REPORT", "等待MQTT连接...")
+        sys.wait(1000)
     end
-end
+    
+    -- 收集所有当前状态数据
+    local reboot_report_data = {}
+    
+    -- 读取继电器状态
+    reboot_report_data.sw11 = fzrelays.get_mode("k1")
+    reboot_report_data.sw12 = fzrelays.get_mode("k2")
+    reboot_report_data.sw13 = fzrelays.get_mode("k3")
+    reboot_report_data.sw14 = fzrelays.get_mode("k4")
+
+    reboot_report_data.water_temp1 = multi_sensor_data.water_temp1 or 0.0
+    reboot_report_data.water_temp2 = multi_sensor_data.water_temp2 or 0.0
+    reboot_report_data.water_temp3 = multi_sensor_data.water_temp3 or 0.0
+    reboot_report_data.water_temp4 = multi_sensor_data.water_temp4 or 0.0
+    reboot_report_data.do_sat1 = multi_sensor_data.do_sat1 or 0.0
+    reboot_report_data.do_sat2 = multi_sensor_data.do_sat2 or 0.0
+    reboot_report_data.do_sat3 = multi_sensor_data.do_sat3 or 0.0
+    reboot_report_data.do_sat4 = multi_sensor_data.do_sat4 or 0.0
+    reboot_report_data.ph1 = multi_sensor_data.ph1 or 0.0
+    reboot_report_data.ph2 = multi_sensor_data.ph2 or 0.0
+    reboot_report_data.ph3 = multi_sensor_data.ph3 or 0.0
+    reboot_report_data.ph4 = multi_sensor_data.ph4 or 0.0
+    
+    log.info("REBOOT_REPORT", "准备上报重启后完整状态")
+    log.info("REBOOT_REPORT_DATA", json.encode(reboot_report_data, "1f"))
+
+    mqtt1:publish(pub_url, json.encode(reboot_report_data, "1f"), 0)
+    mqtt2:publish(ct_pub_url, json.encode(reboot_report_data, "1f"), 0) 
+
+    -- 同步到屏幕
+    send_full_status_to_screen()
+    
+end)
 
 -- Modbus RTU协议解析函数
 function parse_modbus_rtu(data)
@@ -694,7 +1253,11 @@ function process_modbus_command(modbus_data, source)
             -- 更新状态数据
             local key = "sw1" .. string.sub(relay_name, 2)
             multi_sensor_data[key] = state   
-            -- 上报状态变化
+            
+            -- 立即同步到屏幕
+            send_full_status_to_screen()
+            
+            -- 上报状态变化到双平台
             update_changed_data({[key] = state})
         else
             log.warn("MODBUS_CMD", "未知的寄存器地址:", string.format("0x%04X", reg.address))
@@ -702,7 +1265,7 @@ function process_modbus_command(modbus_data, source)
     end
 end
 
--- 修改手动控制命令处理，增加延时
+-- 修改手动控制命令处理，增加延时和屏幕同步
 function process_control_command(json_data, source)
     log.info("CONTROL", string.format("来自%s的控制命令:", source), json.encode(json_data))
     
@@ -726,6 +1289,8 @@ function process_control_command(json_data, source)
         end
     end
     
+    local has_changes = false
+
     -- 原有命令处理逻辑
     for key, val in pairs(json_data) do
         -- 处理本机继电器控制
@@ -738,7 +1303,7 @@ function process_control_command(json_data, source)
                 local current_state = fzrelays.get_mode(relay_name)
                 local target_state = val == 1 and "on" or "off"
                 
-                if (current_state == "on" and val == 1) or (current_state == "off" and val == 0) then
+                if (current_state == 1 and val == 1) or (current_state == 0 and val == 0) then
                     log.info("CONTROL", string.format("继电器 %s 状态已为目标状态，跳过", relay_name))
                 else
                     -- 根据操作类型添加延时
@@ -753,26 +1318,44 @@ function process_control_command(json_data, source)
                     -- 控制继电器
                     fzrelays.set_mode(relay_name, target_state)
                     
+                    -- 等待继电器稳定
+                    sys.wait(500)
+                    
+                    -- 重新读取实际状态
+                    local actual_value = fzrelays.get_mode(relay_name)
+                    
+                    log.info("CONTROL_ACTUAL", string.format("继电器 %s 实际状态: %s (值: %d)", 
+                             relay_name, actual_state, actual_value))
+                    
                     -- 更新状态数据
-                    multi_sensor_data[key] = val
+                    multi_sensor_data[key] = actual_value
+                    has_changes = true
                 end
-         
-                -- 上报状态变化
-                update_changed_data({[key] = val})
-                
             else
                 log.warn("CONTROL", "未知的继电器:", key)
             end    
         end
-        -- 如果是云平台控制且本机继电器状态有变化，同步到屏幕
-        if source == "cloud" then
-            log.info("SCREEN_SYNC", "云平台控制导致继电器状态变化，同步到屏幕")
-            send_full_status_to_screen()
+    end
+
+    -- 如果有状态变化，立即同步到屏幕和双平台
+    if has_changes then
+        -- 立即同步到屏幕
+        send_full_status_to_screen()
+        
+        -- 上报状态变化到双平台
+        local changed_data = {}
+        for key, val in pairs(json_data) do
+            if string.match(key, "^sw1[1-4]$") then
+                changed_data[key] = multi_sensor_data[key]  -- 使用实际读取的状态值
+            end
+        end
+        if next(changed_data) ~= nil then
+            update_changed_data(changed_data)
         end
     end
 end
 
--- 更新变化数据（只发送到MQTT，不发送到屏幕）
+-- 更新变化数据（发送到双平台和屏幕）
 function update_changed_data(new_data)
     if type(new_data) ~= "table" then
         log.error("UPDATE", "无效数据:", type(new_data))
@@ -820,18 +1403,18 @@ function update_changed_data(new_data)
     end
     
     if has_changes then
-        local changed_data_str = json.encode(changed_data, "2f")
-        log.info("UPDATE", "上传变化数据到MQTT:", changed_data_str)
-        
-        -- 只发送到MQTT云平台，不发送到屏幕
-
+        local changed_data_str = json.encode(changed_data, "1f")
+        log.info("UPDATE", "上传变化数据到双平台:", changed_data_str)
+        -- 发送到平台1
         mqtt1:publish(pub_url, changed_data_str, 0)
-        send_full_status_to_screen()
+        -- 发送到平台2
+        mqtt2:publish(ct_pub_url, changed_data_str, 0)
         
-        -- 注意：不再向屏幕发送完整数据，只通过按键状态和485原始数据同步
+        
     else
         log.debug("UPDATE", "数据无变化")
     end
+    send_full_status_to_screen()
 end
 
 -- 传感器数据解析
@@ -840,19 +1423,25 @@ function sensor_parse(data)
     local payload = fztools.hex_to_bytes(data:toHex())
     if fztools.check_crc(payload) then
         if (payload[1] == do_sat1_addr) then
-            multi_sensor_data.water_temp1 = (bit.lshift(payload[4], 8) + payload[5]) * 0.1
-            multi_sensor_data.do_sat1 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+            _, multi_sensor_data.do_sat1 = pack.unpack(string.char(payload[4],payload[5],payload[6],payload[7]),"<f")
+            _, multi_sensor_data.water_temp1 = pack.unpack(string.char(payload[8],payload[9],payload[10],payload[11]),"<f")
         elseif (payload[1] == do_sat2_addr) then
-            multi_sensor_data.water_temp2 = (bit.lshift(payload[4], 8) + payload[5]) * 0.1
-            multi_sensor_data.do_sat2 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+            _, multi_sensor_data.do_sat2 = pack.unpack(string.char(payload[4],payload[5],payload[6],payload[7]),"<f")
+            _, multi_sensor_data.water_temp2 = pack.unpack(string.char(payload[8],payload[9],payload[10],payload[11]),"<f")
         elseif (payload[1] == do_sat3_addr) then
-            multi_sensor_data.water_temp3 = (bit.lshift(payload[4], 8) + payload[5]) * 0.1
-            multi_sensor_data.do_sat3 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+            _, multi_sensor_data.water_temp3 = pack.unpack(string.char(payload[8],payload[9],payload[10],payload[11]),"<f") 
+            _, multi_sensor_data.do_sat3 = pack.unpack(string.char(payload[4],payload[5],payload[6],payload[7]),"<f")
         elseif (payload[1] == do_sat4_addr) then
-            multi_sensor_data.do_sat4 = (bit.lshift(payload[4], 4) + payload[5]) * 0.01
-            multi_sensor_data.water_temp4 = (bit.lshift(payload[6], 4) + payload[7]) * 0.01
+            _, multi_sensor_data.do_sat4 = pack.unpack(string.char(payload[4],payload[5],payload[6],payload[7]),"<f")
+            _, multi_sensor_data.water_temp4 = pack.unpack(string.char(payload[8],payload[9],payload[10],payload[11]),"<f")
         elseif (payload[1] == ph1_addr) then
-            _, multi_sensor_data.ph1 = pack.unpack(string.char(payload[4],payload[5],payload[6],payload[7]),">f")
+            multi_sensor_data.ph1 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+        elseif (payload[1] == ph2_addr) then
+            multi_sensor_data.ph2 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+        elseif (payload[1] == ph3_addr) then
+            multi_sensor_data.ph3 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
+        elseif (payload[1] == ph4_addr) then
+            multi_sensor_data.ph4 = (bit.lshift(payload[6], 8) + payload[7]) * 0.01
         end
         update_changed_data(multi_sensor_data)
     else 
@@ -886,107 +1475,22 @@ function ctrl_parse(data)
     end
 end
 
--- 获取本机数据
-function get_self_data()
+-- 修改get_self_data函数，移植的电流检测
+function get_self_data() 
+    -- 转换为数值
     multi_sensor_data.sw11 = fzrelays.get_mode("k1")
     multi_sensor_data.sw12 = fzrelays.get_mode("k2")
     multi_sensor_data.sw13 = fzrelays.get_mode("k3")
     multi_sensor_data.sw14 = fzrelays.get_mode("k4")
     
-    if rn8302b_chip1_data then
-        multi_sensor_data.current11 = rn8302b_chip1_data[1] or 0
-        multi_sensor_data.current12 = rn8302b_chip1_data[4] or 0
-    end
-    
-    if rn8302b_chip2_data then
-        multi_sensor_data.current13 = rn8302b_chip2_data[1] or 0
-        multi_sensor_data.current14 = rn8302b_chip2_data[4] or 0
-    end
+    -- 移植的电流数据
+    multi_sensor_data.current11 = rn8302b_chip1_data[1] or 0
+    multi_sensor_data.current12 = rn8302b_chip1_data[4] or 0
+    multi_sensor_data.current13 = rn8302b_chip2_data[1] or 0
+    multi_sensor_data.current14 = rn8302b_chip2_data[4] or 0
     
     update_changed_data(multi_sensor_data)
 end
-
--- RN8302B电流监测任务
-sys.taskInit(function()
-    if not rn8302b.init() then
-        log.error("MAIN", "RN8302B初始化失败")
-        return
-    end
-    
-    sys.wait(2000)
-    
-    local read_cycle = 0
-    local current_read_group = 1
-    
-    while true do
-        read_cycle = read_cycle + 1
-        
-        local group_config = READ_GROUP_CONFIG[current_read_group]
-        
-        if group_config then
-            log.debug("RN8302B_READ", string.format("读取: 芯片%d通道%d-%d", 
-                group_config.chip, group_config.channels[1], group_config.channels[3]))
-            
-            local currents = {}
-            for i, channel in ipairs(group_config.channels) do
-                currents[channel] = rn8302b.read_single_current(group_config.chip, channel)
-                sys.wait(30)
-            end
-            
-            if group_config.chip == 1 then
-                for channel, value in pairs(currents) do
-                    rn8302b_chip1_data[channel] = value
-                end
-                for channel, value in pairs(currents) do
-                    current_data.chip1[channel] = value
-                end
-            else
-                for channel, value in pairs(currents) do
-                    rn8302b_chip2_data[channel] = value
-                end
-                for channel, value in pairs(currents) do
-                    current_data.chip2[channel] = value
-                end
-            end
-            
-            -- 更新到传感器数据结构
-            if group_config.chip == 1 then
-                if current_read_group == 1 then
-                    multi_sensor_data.current11 = currents[1] or 0
-                elseif current_read_group == 2 then
-                    multi_sensor_data.current12 = currents[4] or 0
-                end
-            else
-                if current_read_group == 3 then
-                    multi_sensor_data.current13 = currents[1] or 0
-                elseif current_read_group == 4 then
-                    multi_sensor_data.current14 = currents[4] or 0
-                end
-            end
-            
-            log.debug("RN8302B_GROUP", string.format("组%d读取完成", current_read_group))
-            
-            current_read_group = current_read_group + 1
-            if current_read_group > 4 then
-                current_read_group = 1
-                
-                if read_cycle % 5 == 0 then
-                    log.info("RN8302B_FULL", "芯片1电流:", 
-                        string.format("[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]A", 
-                        rn8302b_chip1_data[1] or 0, rn8302b_chip1_data[2] or 0, 
-                        rn8302b_chip1_data[3] or 0, rn8302b_chip1_data[4] or 0,
-                        rn8302b_chip1_data[5] or 0, rn8302b_chip1_data[6] or 0))
-                    log.info("RN8302B_FULL", "芯片2电流:", 
-                        string.format("[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]A", 
-                        rn8302b_chip2_data[1] or 0, rn8302b_chip2_data[2] or 0, 
-                        rn8302b_chip2_data[3] or 0, rn8302b_chip2_data[4] or 0,
-                        rn8302b_chip2_data[5] or 0, rn8302b_chip2_data[6] or 0))
-                end
-            end
-        end 
-        sys.wait(500)
-    end
-end)
 
 function calculate_modbus_crc(data_str)
     local crc = 0xFFFF
@@ -1016,20 +1520,15 @@ sys.taskInit(function()
         -- 等待状态稳定
         sys.wait(100)
         
-        -- 获取继电器状态
-        local state_value = fzrelays.get_mode(key_name)
-        
-        log.info("KEY_STATUS", string.format("继电器 %s 状态: %d", key_name, state_value))
-        
         -- 更新本地数据
         local data_key = "sw1" .. string.sub(key_name, 2)
-        multi_sensor_data[data_key] = state_value
+        multi_sensor_data[data_key] = fzrelays.get_mode(key_name)
         
         -- 发送完整状态数据到屏幕
         send_full_status_to_screen()
         
-        -- 上报状态变化到MQTT
-        update_changed_data({[data_key] = state_value})
+        -- 上报状态变化到双平台
+        update_changed_data(multi_sensor_data)
         
         sys.wait(500)  -- 防抖延迟
     end
@@ -1045,27 +1544,50 @@ sys.taskInit(function()
     sys.timerLoopStart(get_self_data, 1000)
     
     while true do
-        --sys.wait(120000)
-        --supply.on("led_supply1")
-        --supply.on("led_supply2")
-        --sys.wait(120000)
-        
-        -- 读取传感器数据
-        sensor_485:send_command(do_sat1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
+        sensor_485:send_command(do_sat1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x04))
         sys.wait(1000)
-        sensor_485:send_command(do_sat2_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
+        sensor_485:send_command(do_sat2_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x04))
         sys.wait(1000)
-        sensor_485:send_command(do_sat3_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
+        sensor_485:send_command(do_sat3_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x04))
         sys.wait(1000)
-        sensor_485:send_command(do_sat4_addr, 0x03, string.char(0x00, 0x01, 0x00, 0x06))
+        sensor_485:send_command(do_sat4_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x04))
         sys.wait(1000)
         sensor_485:send_command(ph1_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
-        sys.wait(2000)
-       -- 关闭供电
-        --supply.off("led_supply1")
-        --supply.off("led_supply2")
-        --sys.wait(600000)
+        sys.wait(1000)
+        sensor_485:send_command(ph2_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
+        sys.wait(1000)
+        sensor_485:send_command(ph3_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
+        sys.wait(1000)
+        sensor_485:send_command(ph4_addr, 0x03, string.char(0x00, 0x00, 0x00, 0x03))
+        sys.wait(1000)
     end
+end)
+
+sys.taskInit(function()
+   while true do
+        sys.wait(1000)
+        supply.on("led_supply1")
+        sys.wait(5 * 60 * 1000)
+        -- 关闭供电
+        supply.off("led_supply1")
+        sys.wait(15 * 60 * 1000)
+    end
+end)
+
+-- ========== 定时任务和定时重启初始化 ==========
+sys.taskInit(function()
+    sys.wait(1000)
+    
+    -- 开启定时任务检查（每分钟检查一次，提高精度）
+    sys.timerLoopStart(timer_task, 60000)
+    log.info("TIMER_INIT", "定时任务检查已启动（每分钟检查一次）")
+    -- 24小时定时重启
+    sys.timerLoopStart(function()
+        log.info("SYSTEM_REBOOT", "执行24小时定时重启")
+        rtos.reboot()
+    end, 24 * 3600 * 1000 * 3)  --三天重启一次
+    
+    log.info("SYSTEM_INIT", "系统初始化完成，定时重启已设置")
 end)
        
 sys.run()
