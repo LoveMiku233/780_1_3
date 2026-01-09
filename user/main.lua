@@ -1,3 +1,31 @@
+--[[
+@file       main.lua
+@module     main
+@version    000.000.926
+@date       2025-09-02
+@author     yankai
+@brief      鱼塘远程控制系统主程序
+@description
+    基于Air780EHM芯片和LuatOS系统的鱼塘远程控制解决方案。
+    
+    主要功能：
+    1. 多传感器数据采集（溶解氧、水温、pH值等）
+    2. RN8302B六路电流检测与缺相保护
+    3. 四路继电器远程控制
+    4. 双平台MQTT通信（自有平台 + CTWing平台）
+    5. 定时任务管理
+    6. 本地按键控制
+    7. 232屏幕显示
+    8. OTA远程升级
+    
+    硬件接口：
+    - UART1: RS485传感器通信
+    - UART3: RS232屏幕通信
+    - SPI: RN8302B电流检测芯片
+    - I2C: BME280/BMP280温湿度传感器、RX8025T实时时钟
+    - GPIO: 继电器控制、按键输入
+--]]
+
 PROJECT = "main"
 VERSION = "000.000.926"
 author = "yankai"
@@ -7,7 +35,7 @@ _G.sysplus = require("sysplus")
 
 log.setLevel("DEBUG")
 
--- 初始化网络
+-- ========== 模块加载 ==========
 local config = require("config")
 local bme = require("bme")
 local fzmqtt = require("fz_mqtt")
@@ -21,11 +49,10 @@ local RX8025T = require("RX8025T")
 local supply = require("supply")
 local rn8302b = require("rn8302b")
 -- local net_switch = require("net_switch")
--- 添加本地存储模块
 local db = require("config_manager")
 
 
--- 485 modbus
+-- ========== 通信接口变量 ==========
 local ctrl_485 = nil
 local sensor_485 = nil
 local display_232 = nil
@@ -494,7 +521,8 @@ function execute_phase_protection_c_style()
                     
                     -- 断开继电器
                     fzrelays.set_mode(group_config.relay, "off")
-                    dis_func.set_fault_code(1)
+                    -- 故障日志记录
+                    log.error("PHASE_FAULT", string.format("缺相故障触发：继电器%s已断开", group_config.relay))
                     -- 更新继电器状态到数据结构
                     multi_sensor_data[relay_key] = 0
                     
@@ -1323,6 +1351,7 @@ function process_control_command(json_data, source)
                     
                     -- 重新读取实际状态
                     local actual_value = fzrelays.get_mode(relay_name)
+                    local actual_state = (actual_value == 1) and "on" or "off"
                     
                     log.info("CONTROL_ACTUAL", string.format("继电器 %s 实际状态: %s (值: %d)", 
                              relay_name, actual_state, actual_value))

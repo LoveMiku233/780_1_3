@@ -1,3 +1,24 @@
+--[[
+@file       config.lua
+@module     config
+@version    0.1
+@date       2025-09-02
+@author     yankai
+@brief      系统配置模块
+@description
+    包含系统所有配置参数：
+    1. 固件升级URL和产品密钥
+    2. MQTT平台1（自有平台）配置
+    3. MQTT平台2（CTWing电信平台）配置
+    
+    使用方法：
+    local config = require("config")
+    -- 访问配置
+    local mqtt_host = config.mqtt.host
+    -- 更新配置
+    config.update({mqtt = {port = 1884}})
+--]]
+
 local config = {
     FIRMWARE_URL = "http://firmware.dtu.fanzhou.cloud/upgrade", -- 固件升级地址
     PRODUCT_KEY = "XJUDU1KX70pyrXS6aofI1qy7plwBj69X",  -- 产品 ota Key
