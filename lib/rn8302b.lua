@@ -1,3 +1,31 @@
+--[[
+@file       rn8302b.lua
+@module     rn8302b
+@version    0.1
+@date       2025-09-02
+@author     yankai
+@brief      RN8302B六路电流检测芯片驱动
+@description
+    基于软件SPI实现的RN8302B电流检测芯片驱动。
+    
+    主要功能：
+    1. 双芯片支持（共12路电流检测）
+    2. 单通道/多通道电流读取
+    3. 可配置校准系数
+    4. 多次采样滤波
+    
+    硬件连接：
+    - SPI_CS1: GPIO5（第一个RN8302B片选）
+    - SPI_CS2: GPIO4（第二个RN8302B片选）
+    - SPI_CLK: GPIO3（时钟）
+    - SPI_MISO: GPIO6（主入从出）
+    - SPI_MOSI: GPIO7（主出从入）
+    
+    寄存器映射：
+    - 通道1-3: 0x0B, 0x0C, 0x0D
+    - 通道4-6: 0x07, 0x08, 0x09
+--]]
+
 local RN8302B = {}
 
 -- 配置
